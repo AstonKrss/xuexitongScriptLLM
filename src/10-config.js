@@ -34,7 +34,7 @@ const PROVIDER_PRESETS = [
     models: ['glm-4.7-flash', 'glm-5.3-flash', 'glm-4-flash', 'glm-5.3'],
     protocol: 'openai',
     jsonMode: true,
-    note: 'glm-4.7-flash 免费（输入/输出/缓存全免）；glm-5.3-flash 便宜但收费；glm-5.3 是旗舰。',
+    note: '默认 glm-4.7-flash，也支持 glm-5.3-flash 和旗舰 glm-5.3。',
   },
   {
     id: 'dashscope',
@@ -44,7 +44,7 @@ const PROVIDER_PRESETS = [
     models: ['qwen-turbo', 'qwen-plus', 'qwen-max'],
     protocol: 'openai',
     jsonMode: true,
-    note: '走官方 OpenAI 兼容模式，支持 JSON 输出。新账号有免费 token 额度。',
+    note: '走官方 OpenAI 兼容模式，支持 JSON 输出。',
   },
   {
     id: 'moonshot',

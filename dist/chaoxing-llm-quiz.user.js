@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.5.2
+// @version      1.5.3
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.5.2';
+const VERSION = '1.5.3';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -3316,7 +3316,7 @@ const PROVIDER_PRESETS = [
     models: ['glm-4.7-flash', 'glm-5.3-flash', 'glm-4-flash', 'glm-5.3'],
     protocol: 'openai',
     jsonMode: true,
-    note: 'glm-4.7-flash 免费（输入/输出/缓存全免）；glm-5.3-flash 便宜但收费；glm-5.3 是旗舰。',
+    note: '默认 glm-4.7-flash，也支持 glm-5.3-flash 和旗舰 glm-5.3。',
   },
   {
     id: 'dashscope',
@@ -3326,7 +3326,7 @@ const PROVIDER_PRESETS = [
     models: ['qwen-turbo', 'qwen-plus', 'qwen-max'],
     protocol: 'openai',
     jsonMode: true,
-    note: '走官方 OpenAI 兼容模式，支持 JSON 输出。新账号有免费 token 额度。',
+    note: '走官方 OpenAI 兼容模式，支持 JSON 输出。',
   },
   {
     id: 'moonshot',
