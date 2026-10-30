@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.6.0
+// @version      1.6.1
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -5595,7 +5595,14 @@ const FontDecoder = {
               try {
                 const j = JSON.parse(res.responseText);
                 const text = String((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
-                const ch = text.replace(/[^\u4e00-\u9fa5]/g, '').charAt(0);
+                // 模型不一定守规矩：可能回「是【党】。」或「答案：党」。
+                // 先剥掉括号标点，再去掉开头的"是/答案/答"，最后取第一个汉字——
+                // 直接取第一个汉字会把"是"当成识别结果（真实踩过的坑）。
+                const cleaned = text
+                  .replace(/[\s【】（）()。．.,，:：;；、'"“”·—-]/g, '')
+                  .replace(/^(?:答案是|是|答案|答)/, '');
+                const m = cleaned.match(/[\u4e00-\u9fa5]/);
+                const ch = m ? m[0] : null;
                 resolve(ch || null);
               } catch (e) { resolve(null); }
             },

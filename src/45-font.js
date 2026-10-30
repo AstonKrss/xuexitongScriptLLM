@@ -447,7 +447,14 @@ const FontDecoder = {
               try {
                 const j = JSON.parse(res.responseText);
                 const text = String((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
-                const ch = text.replace(/[^\u4e00-\u9fa5]/g, '').charAt(0);
+                // 模型不一定守规矩：可能回「是【党】。」或「答案：党」。
+                // 先剥掉括号标点，再去掉开头的"是/答案/答"，最后取第一个汉字——
+                // 直接取第一个汉字会把"是"当成识别结果（真实踩过的坑）。
+                const cleaned = text
+                  .replace(/[\s【】（）()。．.,，:：;；、'"“”·—-]/g, '')
+                  .replace(/^(?:答案是|是|答案|答)/, '');
+                const m = cleaned.match(/[\u4e00-\u9fa5]/);
+                const ch = m ? m[0] : null;
                 resolve(ch || null);
               } catch (e) { resolve(null); }
             },

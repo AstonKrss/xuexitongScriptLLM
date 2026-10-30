@@ -182,6 +182,161 @@ if (fs.existsSync(FONT_PATH)) {
   console.log('  （跳过：本机没有 ' + FONT_PATH + '）');
 }
 
+/* ---------- 视觉识别未收录字形（v1.6.0） ---------- */
+console.log('\n[视觉识别]');
+
+{
+  // glyphImageDataUrl / loadFontFace 依赖 canvas 和 FontFace，Node 里没有；
+  // 但 identifyMissedGlyphs 的核心逻辑（请求编排、结果解析、持久化、跳过已知）
+  // 可以通过替换这两个方法 + mock GM 层做端到端验证。
+
+  // 可变的 GM 存储，模拟脚本管理器的持久化
+  const store = {};
+  global.GM_getValue = (k, d) => (k in store ? store[k] : d);
+  global.GM_setValue = (k, v) => { store[k] = v; };
+
+  // 收集所有发出的请求，按序回放预设响应
+  let pendingRequests = [];
+  let sentRequests = [];
+  global.GM_xmlhttpRequest = function (opts) {
+    sentRequests.push(opts);
+    const r = pendingRequests.shift();
+    if (r) setTimeout(() => opts.onload(r), 0);
+    else setTimeout(() => opts.onerror && opts.onerror({ error: 'no mock' }), 0);
+  };
+
+  // 独立的解码器实例（避免污染上面真实链路测试的状态）
+  const VD = Object.create(FD);
+  VD.map = new Map();
+  VD.samples = [];
+  VD.stats = { chars: 2, matched: 0, missed: 2, notInFont: 0 };
+  VD.missedGlyphs = [{ key: 'hashAAA', ch: '吜' }, { key: 'hashBBB', ch: '嬤' }];
+  VD.fontBytes = new Uint8Array([1]);
+  // canvas / FontFace 都没有 → 渲染和挂载用桩顶上
+  VD.glyphImageDataUrl = (ch) => 'data:image/png;base64,FAKE_' + ch;
+  VD.loadFontFace = async () => true;
+
+  const mkRes = (text) => ({ responseText: JSON.stringify({ choices: [{ message: { content: text } }] }) });
+
+  // 1) 模型正常认出两个字
+  pendingRequests = [mkRes('党'), mkRes('成')];
+  const r1 = await (async () => {
+    try { return await VD.identifyMissedGlyphs({ model: 'test-vision', apiKey: 'k' }); }
+    catch (e) { return { identified: -1, failed: -1, err: e.message }; }
+  })();
+  eq(r1, { identified: 2, failed: 0 }, '两个未收录字形全部识别成功');
+  eq(sentRequests.length, 2, '发出 2 次视觉请求');
+  ok(sentRequests[0].data.indexOf('data:image/png') >= 0, '请求体带 PNG dataURL（image_url 格式）');
+  ok(sentRequests[0].data.indexOf('test-vision') >= 0, '请求体带模型名');
+  ok(sentRequests[0].headers.Authorization === 'Bearer k', '带 Bearer 鉴权头');
+  eq(VD.map.get('吜'), '党', '识别结果写入内存映射（吜→党）');
+  eq(VD.map.get('嬤'), '成', '识别结果写入内存映射（嬤→成）');
+
+  // 2) 持久化：扩展表里按字形哈希存了码点。
+  //    gmSet 以 JSON 字符串落盘，读回时必须 parse（这里曾经直读字符串导致误报）
+  const extra = JSON.parse(store['llmq:glyphExtra'] || '{}');
+  eq(extra['hashAAA'], '党'.codePointAt(0), '扩展表按哈希存码点（hashAAA→党）');
+  eq(extra['hashBBB'], '成'.codePointAt(0), '扩展表按哈希存码点（hashBBB→成）');
+
+  // 3) 已经认过的字形不再发请求
+  sentRequests = [];
+  const VD2 = Object.create(FD);
+  VD2.map = new Map();
+  VD2.samples = [];
+  VD2.stats = { chars: 1, matched: 0, missed: 1, notInFont: 0 };
+  VD2.missedGlyphs = [{ key: 'hashAAA', ch: '吜' }];
+  VD2.fontBytes = new Uint8Array([1]);
+  VD2.glyphImageDataUrl = () => 'data:image/png;base64,X';
+  VD2.loadFontFace = async () => true;
+  const r2 = await VD2.identifyMissedGlyphs({ model: 'test-vision', apiKey: 'k' });
+  eq(r2.identified, 1, '已识别过的字形直接命中，identified 计数');
+  eq(sentRequests.length, 0, '★ 已识别过的字形不再发请求（一次识别永久生效）');
+
+  // 4) 模型回答含杂质（"是【党】。"）→ 只留汉字
+  sentRequests = [];
+  const VD3 = Object.create(FD);
+  VD3.map = new Map();
+  VD3.samples = [];
+  VD3.stats = { chars: 1, matched: 0, missed: 1, notInFont: 0 };
+  VD3.missedGlyphs = [{ key: 'hashCCC', ch: '呉' }];
+  VD3.fontBytes = new Uint8Array([1]);
+  VD3.glyphImageDataUrl = () => 'data:image/png;base64,X';
+  VD3.loadFontFace = async () => true;
+  pendingRequests = [mkRes('是【党】。')];
+  const r3 = await VD3.identifyMissedGlyphs({ model: 'test-vision', apiKey: 'k' });
+  eq(r3, { identified: 1, failed: 0 }, '模型回答带杂质时仍能提取汉字');
+  eq(VD3.map.get('呉'), '党', '杂质被过滤，映射正确');
+
+  // 5) 模型答非汉字 → failed 计数，不写表
+  sentRequests = [];
+  pendingRequests = [mkRes('sorry I cannot')];
+  const r4 = await VD3.identifyMissedGlyphs({ model: 'test-vision', apiKey: 'k' });
+  // 注意 VD3 的 missedGlyphs 只有 1 项且已被标记 → 换新 key 才会真的请求
+  ok(r4.identified === 1 && r4.failed === 0, '已识别的不重复处理');
+  const VD4 = Object.create(FD);
+  VD4.map = new Map();
+  VD4.samples = [];
+  VD4.stats = { chars: 1, matched: 0, missed: 1, notInFont: 0 };
+  VD4.missedGlyphs = [{ key: 'hashDDD', ch: '吚' }];
+  VD4.fontBytes = new Uint8Array([1]);
+  VD4.glyphImageDataUrl = () => 'data:image/png;base64,X';
+  VD4.loadFontFace = async () => true;
+  pendingRequests = [mkRes('???')];
+  const r5 = await VD4.identifyMissedGlyphs({ model: 'test-vision', apiKey: 'k' });
+  eq(r5, { identified: 0, failed: 1 }, '模型答非汉字 → 计入 failed');
+  eq(VD4.map.get('吚'), undefined, 'failed 不写映射');
+  ok(!JSON.parse(store['llmq:glyphExtra'] || '{}')['hashDDD'], 'failed 不写持久化表');
+
+  // 6) 网络失败（onerror）→ failed，不崩
+  sentRequests = [];
+  pendingRequests = [];  // 空队列 → 走 onerror
+  const VD5 = Object.create(FD);
+  VD5.map = new Map();
+  VD5.samples = [];
+  VD5.stats = { chars: 1, matched: 0, missed: 1, notInFont: 0 };
+  VD5.missedGlyphs = [{ key: 'hashEEE', ch: '妑' }];
+  VD5.fontBytes = new Uint8Array([1]);
+  VD5.glyphImageDataUrl = () => 'data:image/png;base64,X';
+  VD5.loadFontFace = async () => true;
+  const r6 = await VD5.identifyMissedGlyphs({ model: 'test-vision', apiKey: 'k' });
+  eq(r6, { identified: 0, failed: 1 }, '请求失败（onerror）→ failed 且不抛异常');
+
+  // 7) 没填模型名 → 直接 no-op
+  sentRequests = [];
+  const r7 = await VD5.identifyMissedGlyphs({});
+  eq(r7, { identified: 0, failed: 1 }, '未配置视觉模型 → no-op 不发请求');
+  eq(sentRequests.length, 0, 'no-op 确实没发请求');
+
+  // 8) 停止指令生效
+  const VD6 = Object.create(FD);
+  VD6.map = new Map();
+  VD6.samples = [];
+  VD6.stats = { chars: 2, matched: 0, missed: 2, notInFont: 0 };
+  VD6.missedGlyphs = [{ key: 'hashF1', ch: '吥' }, { key: 'hashF2', ch: '玢' }];
+  VD6.fontBytes = new Uint8Array([1]);
+  VD6.glyphImageDataUrl = () => 'data:image/png;base64,X';
+  VD6.loadFontFace = async () => true;
+  VD6.stopGlyphScan = true;
+  sentRequests = [];
+  const r8 = await VD6.identifyMissedGlyphs({ model: 'test-vision', apiKey: 'k' });
+  eq(sentRequests.length, 0, '停止指令下不发请求');
+
+  // 9) buildMap 的扩展表查找：extra 里的哈希要能顶上内置表没有的字形。
+  //    直接验证查找表达式（table.get(key) || extra[key]）的语义：
+  const table = new Map();                      // 内置表为空
+  const extra2 = { hashAAA: '党'.codePointAt(0) };
+  const key = 'hashAAA';
+  const real = table.get(key) || (extra2[key] || null);
+  eq(String.fromCharCode(real), '党', '扩展表码点还原为字符');
+  const miss = table.get('nope') || (extra2['nope'] || null);
+  eq(miss, null, '两边都查不到 → null → 进 missedList');
+
+  // 恢复全局 GM 桩，避免影响其它测试文件（同进程无此问题，但保持整洁）
+  global.GM_getValue = () => undefined;
+  global.GM_setValue = () => {};
+  global.GM_xmlhttpRequest = function () {};
+}
+
 /* ---------- Typr 可用性 ---------- */
 console.log('\n[Typr]');
 
