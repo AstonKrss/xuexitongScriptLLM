@@ -165,19 +165,19 @@ const UI = {
     return configured;
   },
 
-  /** 由 Main 告知当前页面类型：答题页显示「开始答题」，课程页显示「自动刷课」——
-   *  同一个位置只放一个主操作，自动刷课本身就包含答题，用户不需要两个都看到 */
+  /** 由 Main 告知当前页面类型：主按钮只有一个，文案和动作随类型切换——
+   *  课程页 →「自动刷课」，答题页 →「开始答题」。
+   *  之前是两个按钮 + 显隐控制，判定出错时会出现两个同名按钮/全消失，
+   *  单按钮动态切换从根上消除这种状态不同步。 */
   setPageKind(kind) {
     this.pageKind = kind;
     try {
-      const startBtn = this.shadow && this.shadow.querySelector('[data-act="start"]');
-      const pilotBtn = this.shadow && this.shadow.querySelector('[data-act="pilot"]');
-      if (startBtn) startBtn.style.display = (kind === 'quiz') ? '' : 'none';
-      if (pilotBtn) pilotBtn.style.display = (kind === 'quiz') ? 'none' : '';
+      const mainBtn = this.shadow && this.shadow.querySelector('[data-act="main"]');
+      if (mainBtn) mainBtn.textContent = (kind === 'quiz') ? '开始答题' : '自动刷课';
     } catch (e) { /* 忽略 */ }
     // 版本号写进 tooltip，这样不用开 F12 也能确认装的是哪一版
     if (this.ballEl) {
-      this.ballEl.title = '超星答题助手 v' + VERSION + (kind === 'quiz' ? '（答题页）' : '（非答题页）');
+      this.ballEl.title = '超星答题助手 v' + VERSION + (kind === 'quiz' ? '（答题页）' : '（课程页）');
     }
   },
 
@@ -189,13 +189,12 @@ const UI = {
       <a class="repo" href="${REPO_URL}" target="_blank" title="GitHub · AstonKrss">GitHub</a></div>
     <div class="log"></div>
     <div class="acts">
-      <button class="primary" data-act="start">开始答题</button>
+      <button class="primary" data-act="main">开始</button>
       <button data-act="stop" class="danger">停止</button>
       <button data-act="preview">只解析</button>
       <button data-act="settings">设置</button>
     </div>
     <div class="acts" style="padding-top:0;border-top:none">
-      <button data-act="pilot">自动刷课</button>
       <button data-act="decode">解码预览</button>
       <button data-act="font">导出字体</button>
     </div>
@@ -338,26 +337,23 @@ const UI = {
       const btn = e.target.closest('[data-act]');
       if (!btn) return;
       const act = btn.getAttribute('data-act');
-      if (act === 'start') {
-        // 非答题页时按钮不做事，直接说明原因，比让解析器空跑一遍再报错清楚
-        if (this.pageKind !== 'quiz') {
-          log('当前页面不是答题页。先进入章节测试或作业页，再点「开始答题」', 'error');
-          return;
+      // 主按钮：同一个按钮，动作随当前页面类型切换
+      if (act === 'main') {
+        if (this.pageKind === 'quiz') {
+          if (typeof CoursePilot !== 'undefined' && CoursePilot.running) {
+            log('自动刷课正在运行，它会自己处理作业。要手动答题请先停止刷课', 'warn');
+            return;
+          }
+          Runner.start();
+        } else {
+          this.togglePilot();
         }
-        // 自动刷课在跑的时候，手动开始答题会和它抢页面：两边同时点选项、
-        // 同时改状态，最后谁的判断都不作数。这里直接拦住。
-        if (typeof CoursePilot !== 'undefined' && CoursePilot.running) {
-          log('自动刷课正在运行，它会自己处理作业。要手动答题请先停止刷课', 'warn');
-          return;
-        }
-        Runner.start();
       }
       else if (act === 'stop') {
         // 刷课期间点「停止」，用户想停的多半是整个刷课流程
         if (typeof CoursePilot !== 'undefined' && CoursePilot.running) CoursePilot.stop();
         Runner.stop();
       }
-      else if (act === 'skipwait') Runner.skipWait();
       else if (act === 'pilot') this.togglePilot();
       else if (act === 'preview') Runner.preview();
       else if (act === 'settings') this.openSettings();
