@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.6.2
+// @version      1.6.3
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.6.2';
+const VERSION = '1.6.3';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -7928,30 +7928,58 @@ const CoursePilot = {
       '&jobId=' + encodeURIComponent(item.jobid || '') +
       '&enc=' + encodeURIComponent(item.enc || '');
 
+    // 作业页必须被加载（保存调的是页面自己的 noSubmit()），但不需要被看见——
+    // iframe 收起成一条小横条照样加载、照样填答案。点横条可展开查看答题过程。
+    const NAME = 'llmq-work-frame';
     let f = null;
-    try { f = d.getElementById('llmq-work-frame'); } catch (e) { f = null; }
+    let box = null;
+    try { f = d.getElementById(NAME); } catch (e) { f = null; }
     if (!f) {
       try {
+        box = d.createElement('div');
+        box.id = NAME + '-box';
+        box.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;' +
+          'border:2px solid #4a90d9;border-radius:8px;background:#fff;' +
+          'box-shadow:0 4px 16px rgba(0,0,0,.35);overflow:hidden;';
+
+        const bar = d.createElement('div');
+        bar.style.cssText = 'padding:6px 12px;font:13px/1.4 sans-serif;color:#1a5c9e;' +
+          'background:#eaf3fc;cursor:pointer;user-select:none;white-space:nowrap;';
+        bar.textContent = '📋 作业答题中…（点此展开 / 收起）';
+        bar.addEventListener('click', () => {
+          const frame = d.getElementById(NAME);
+          if (!frame) return;
+          const hidden = frame.style.display === 'none';
+          frame.style.display = hidden ? '' : 'none';
+          if (!hidden) box.style.width = '';       // 展开时恢复容器自适应
+          bar.textContent = hidden ? '📋 作业答题中…（点此收起）' : '📋 作业已收起，仍在后台答题（点此展开）';
+        });
+
         f = d.createElement('iframe');
-        f.id = 'llmq-work-frame';
-        f.style.cssText = 'position:fixed;right:12px;bottom:12px;width:460px;height:620px;' +
-          'z-index:2147483647;border:2px solid #4a90d9;border-radius:8px;background:#fff;' +
-          'box-shadow:0 4px 16px rgba(0,0,0,.35);';
-        (d.body || d.documentElement).appendChild(f);
+        f.id = NAME;
+        f.style.cssText = 'width:460px;height:620px;border:none;display:none;background:#fff;';
+        f.setAttribute('data-collapsed', '1');
+
+        box.appendChild(bar);
+        box.appendChild(f);
+        (d.body || d.documentElement).appendChild(box);
       } catch (e) {
         log('创建作业窗口失败：' + e.message, 'error');
         return null;
       }
     }
     f.src = url;
-    log('作业已在右下角窗口打开（做完会自动关掉）', 'info');
+    log('作业页已在后台加载（默认收起，点右下角横条可展开查看；做完自动关掉）', 'info');
     return f;
   },
 
   closeWorkFrame(doc) {
     try {
-      const f = (doc || document).getElementById('llmq-work-frame');
+      const d = doc || document;
+      const f = d.getElementById('llmq-work-frame');
       if (f) f.remove();
+      const box = d.getElementById('llmq-work-frame-box');
+      if (box) box.remove();
     } catch (e) { /* 忽略 */ }
   },
 
