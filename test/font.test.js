@@ -1,0 +1,198 @@
+/* ============================================================
+ * test/font.test.js —— 字体解码（v3：字形轮廓哈希）
+ *
+ * v2 用 canvas 位图比对，在 Node 里根本没法验证，也测不出「解错了」——
+ * 因为它从不报错，只会给出一个看似合理的错字。
+ *
+ * v3 改成解析字体轮廓算哈希，每一步都能单独验证：
+ *   MD5 实现对不对、base64 解的对不对、CSS 里的字体找得对不对，
+ *   以及最关键的——**表和字体对不上时会不会正确地停下来**。
+ *
+ * 最后一项用系统自带黑体做真实链路：黑体的字形哈希必然查不到思源黑体的表，
+ * 正确行为是判定失败并停用，而不是硬解出一堆错字。
+ *
+ * 运行：node test/font.test.js
+ * ============================================================ */
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { JSDOM } = require('jsdom');
+
+const SRC = path.join(__dirname, '..', 'src');
+const MODULES = ['00-core.js', '05-lib-typr.js', '06-cx-table.js', '45-font.js'];
+
+let passed = 0;
+let failed = 0;
+function ok(cond, label) {
+  if (cond) passed++;
+  else { failed++; console.log('  ✗ ' + label); }
+}
+function eq(actual, expected, label) {
+  const good = JSON.stringify(actual) === JSON.stringify(expected);
+  if (good) passed++;
+  else { failed++; console.log(`  ✗ ${label}\n      期望 ${JSON.stringify(expected)}\n      实际 ${JSON.stringify(actual)}`); }
+}
+
+const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'https://mooc1.chaoxing.com/' });
+const w = dom.window;
+global.window = w;
+global.document = w.document;
+// 注意：不要用 jsdom 的 atob —— 它依赖内部 window 状态，脱离上下文调用会误报
+// 「contains invalid characters」。Node 16+ 自带全局 atob，浏览器里也有。
+global.GM_getValue = () => undefined;
+global.GM_setValue = () => {};
+global.GM_xmlhttpRequest = function () {};
+
+const code = MODULES.map((f) => fs.readFileSync(path.join(SRC, f), 'utf8')).join('\n');
+// eslint-disable-next-line no-new-func
+const api = new Function(`${code}\nreturn { FontDecoder, md5Hex, base64ToBytes, getCxGlyphMap, CX_GLYPH_KEYS, CX_GLYPH_CHARS, CX_GLYPH_COUNT, Typr };`)();
+const FD = api.FontDecoder;
+
+/* ---------- MD5 ---------- */
+console.log('\n[MD5]');
+
+// 自己实现的 MD5 必须和 OpenSSL 完全一致，否则所有哈希都对不上表
+const md5Inputs = ['', 'abc', '中文', 'a'.repeat(55), 'a'.repeat(56), 'a'.repeat(64), 'a'.repeat(1000), '{"cmds":["M"],"crds":[1,2]}'];
+let md5ok = true;
+for (const s of md5Inputs) {
+  const mine = api.md5Hex(s);
+  const ref = crypto.createHash('md5').update(Buffer.from(s, 'utf8')).digest('hex');
+  if (mine !== ref) {
+    md5ok = false;
+    console.log('    不一致: ' + JSON.stringify(s.slice(0, 20)) + ' ' + mine + ' != ' + ref);
+  }
+}
+ok(md5ok, '★ 自实现 MD5 与 Node crypto 一致（8 组输入，含 55/56/64 字节分块边界）');
+eq(api.md5Hex('abc'), '900150983cd24fb0d6963f7d28e17f72', '标准测试向量 abc');
+eq(api.md5Hex('中文').length, 32, '中文输入输出 32 位十六进制');
+
+/* ---------- base64 ---------- */
+console.log('\n[base64]');
+
+{
+  const raw = 'font-binary-\u0000\u0001\u00ff';
+  const buf = Buffer.from(raw, 'latin1');
+  const out = api.base64ToBytes(buf.toString('base64'));
+  ok(out.length === buf.length, 'base64 解出的长度一致');
+  let same = true;
+  for (let i = 0; i < buf.length; i++) if (out[i] !== buf[i]) same = false;
+  ok(same, '★ base64 解出的字节完全一致');
+  ok(api.base64ToBytes('YWJj\n  ').length === 3, '忽略换行和空格');
+}
+
+/* ---------- 对照表结构 ---------- */
+console.log('\n[对照表]');
+
+ok(api.CX_GLYPH_COUNT > 20000, `对照表条目数 ${api.CX_GLYPH_COUNT}（应覆盖 CJK 基本区）`);
+eq(api.CX_GLYPH_KEYS.length, api.CX_GLYPH_COUNT * 8, '★ 哈希串长度 = 条目数 × 8（错位一位就整表失效）');
+eq(api.CX_GLYPH_CHARS.length, api.CX_GLYPH_COUNT, '汉字串长度 = 条目数');
+
+{
+  const m = api.getCxGlyphMap();
+  eq(m.size, api.CX_GLYPH_COUNT, 'Map 条目数与表一致');
+  // 随机抽 200 条验证「键 → 值」的对应关系没被切片错位
+  let spot = true;
+  for (let i = 0; i < 200; i++) {
+    const idx = Math.floor(Math.random() * api.CX_GLYPH_COUNT);
+    const k = api.CX_GLYPH_KEYS.substring(idx * 8, idx * 8 + 8);
+    if (m.get(k) !== api.CX_GLYPH_CHARS.charCodeAt(idx)) { spot = false; break; }
+  }
+  ok(spot, '★ 随机抽查 200 条，哈希与汉字的对应关系正确');
+  ok(/^[0-9a-f]{8}$/.test(api.CX_GLYPH_KEYS.slice(0, 8)), '哈希是小写 8 位十六进制');
+}
+
+/* ---------- 从 CSS 里找字体 ---------- */
+console.log('\n[定位字体]');
+
+{
+  const css = '<style id="cxSecretStyle">@font-face{font-family:font-cxsecret;src:url("data:application/font-ttf;base64,AAAA")}.font-cxsecret{font-family:font-cxsecret}</style>';
+  const r = FD.extractFontSrc(css);
+  ok(!!r, '能认出标准的内嵌 base64 字体');
+  eq(r && r.kind, 'base64', '类型是 base64');
+  eq(r && r.value, 'AAAA', '取到 base64 内容');
+}
+
+{
+  const css = "@font-face{font-family:'font-cxsecret';src:url(https://cdn.example.com/a.woff?v=2) format('woff')}";
+  const r = FD.extractFontSrc(css);
+  eq(r && r.kind, 'url', '外链 woff 也能认出来');
+  eq(r && r.value, 'https://cdn.example.com/a.woff?v=2', '外链地址完整保留');
+}
+
+{
+  // 反例：只有 class 没有 @font-face。医学英语这类页面就是这样，文字本来是明文
+  eq(FD.extractFontSrc('.font-cxsecret{font-family:font-cxsecret}'), null,
+    '★ 只有 class 没有 @font-face → 判定没有加密字体');
+  eq(FD.extractFontSrc(''), null, '空 CSS 安全');
+  eq(FD.extractFontSrc('<style>.a{color:red}</style>'), null, '无关 CSS 返回 null');
+}
+
+{
+  // 没有 font-cxsecret 字样但确实有字体 data URL：兜底路径
+  const r = FD.extractFontSrc('body{background:url(data:application/x-font-ttf;base64,BBBB)}');
+  ok(!!r, '兜底能匹配不带 font-cxsecret 字样的字体 data URL');
+}
+
+/* ---------- 未就绪时不能改字 ---------- */
+console.log('\n[未就绪]');
+
+(async () => {
+{
+  eq(FD.decode('聚厩2035年'), '聚厩2035年', '★ 未就绪时 decode 原样返回');
+  eq(FD.decode(''), '', '空串安全');
+  eq(FD.decode(null), null, 'null 安全');
+  eq(FD.decode(undefined), undefined, 'undefined 安全');
+  ok(FD.describeSamples().length > 0, 'describeSamples 有兜底文案');
+}
+
+{
+  // 页面没有字体时 ensureReady 要返回 false，而不是抛错或卡住
+  const empty = new JSDOM('<html><body><div class="font-cxsecret">聚厩</div></body></html>').window.document;
+  const ready = await FD.ensureReady(empty);
+  ok(ready === false, '没有字体时 ensureReady 返回 false');
+  ok(FD.failedReason.indexOf('没有') >= 0, '给出了可读的失败原因');
+  ok(FD.giveUp === false, '这种情况不算"表不匹配"，不置 giveUp');
+}
+
+/* ---------- 真实字体：表不匹配必须停下 ---------- */
+console.log('\n[真实字体链路]');
+
+const FONT_PATH = 'C:/Windows/Fonts/simhei.ttf';
+if (fs.existsSync(FONT_PATH)) {
+  const b64 = fs.readFileSync(FONT_PATH).toString('base64');
+  const html = `<!doctype html><html><head>
+    <style id="cxSecretStyle">@font-face{font-family:font-cxsecret;src:url("data:application/font-ttf;base64,${b64}")}.font-cxsecret{font-family:font-cxsecret}</style>
+  </head><body><div class="font-cxsecret">中国的首都是北京</div></body></html>`;
+  const d = new JSDOM(html, { url: 'https://mooc1.chaoxing.com/' }).window.document;
+
+  ok(FD.available(d) === true, '能识别出页面里有加密字体');
+
+  const chars = Array.from(FD.collectEncryptedChars(d));
+  ok(chars.length === 8, `采集到 8 个加密字符（实际 ${chars.length}）`);
+
+  // 黑体的字形和思源黑体不同，哈希必然查不到表。
+  // 正确行为：判定失败、置 giveUp、绝不硬解。
+  const ready = await FD.ensureReady(d);
+  ok(ready === false, '★ 字形与对照表不符时 ensureReady 返回 false');
+  ok(FD.giveUp === true, '★ 置 giveUp，本次会话不再重试（避免每次点开始都白等）');
+  ok(/匹配失败|命中率过低/.test(FD.failedReason), '失败原因指向哈希不匹配：' + FD.failedReason);
+  eq(FD.decode('中国的首都'), '中国的首都', '★ 失败后 decode 一个字都不改');
+} else {
+  console.log('  （跳过：本机没有 ' + FONT_PATH + '）');
+}
+
+/* ---------- Typr 可用性 ---------- */
+console.log('\n[Typr]');
+
+ok(api.Typr && typeof api.Typr.parse === 'function', 'Typr.parse 可用');
+ok(api.Typr.U && typeof api.Typr.U.codeToGlyph === 'function', 'Typr.U.codeToGlyph 可用');
+ok(api.Typr.U && typeof api.Typr.U.glyphToPath === 'function', 'Typr.U.glyphToPath 可用');
+
+console.log(`\n${'─'.repeat(40)}`);
+console.log(`通过 ${passed} 项，失败 ${failed} 项`);
+process.exit(failed > 0 ? 1 : 0);
+})().catch((e) => {
+  console.error('测试异常：', e);
+  process.exit(1);
+});

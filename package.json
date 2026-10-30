@@ -1,0 +1,16 @@
+{
+  "name": "chaoxing-llm-quiz",
+  "version": "1.4.2",
+  "description": "超星答题助手：LLM 答题 + 自动刷课（视频 1x 真实播放 / 文档标记 / 作业自动答题）",
+  "author": "AstonKrss",
+  "license": "MIT",
+  "homepage": "https://github.com/AstonKrss/xuexitongScriptLLM",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "test": "node test/run-all.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
