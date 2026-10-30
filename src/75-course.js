@@ -630,6 +630,7 @@ const CoursePilot = {
           'box-shadow:0 4px 16px rgba(0,0,0,.35);overflow:hidden;';
 
         const bar = d.createElement('div');
+        bar.id = 'llmq-work-bar';
         bar.style.cssText = 'padding:6px 12px;font:13px/1.4 sans-serif;color:#1a5c9e;' +
           'background:#eaf3fc;cursor:pointer;user-select:none;white-space:nowrap;';
         bar.textContent = '📋 作业答题中…（点此展开 / 收起）';

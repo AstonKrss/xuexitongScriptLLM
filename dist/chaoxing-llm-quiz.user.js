@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.6.3
+// @version      1.6.4
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.6.3';
+const VERSION = '1.6.4';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -6034,6 +6034,29 @@ function waitFor(cond, timeout, interval) {
 }
 
 /**
+ * 更新右下角作业横条的文字。答题发生在 iframe 里，横条在父页面——
+ * 同源可以跨文档找到它。答题全程在这里播报进度，让用户在**大页面**上
+ * 就能看到"活着没卡"：开始 → 12/60 → 完成，而不是一条永远不动的横条。
+ * @param {string} text 要显示的文字（不需要带"点此展开"尾巴，这里统一补）
+ * @returns {boolean} 是否找到了横条
+ */
+function updateWorkBar(text) {
+  const docs = [];
+  try { docs.push(document); } catch (e) { /* 忽略 */ }
+  try { if (window.parent && window.parent.document) docs.push(window.parent.document); } catch (e) { /* 跨域 */ }
+  try { if (window.top && window.top.document && window.top !== window.parent) docs.push(window.top.document); } catch (e) { /* 跨域 */ }
+  for (const d of docs) {
+    let bar = null;
+    try { bar = d.getElementById('llmq-work-bar'); } catch (e) { bar = null; }
+    if (bar) {
+      bar.textContent = text + '（点此展开）';
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 保存之后这份作业算"完成"还是"未完成"——刷课跳不跳下一节就看它。
  * 原脚本（unrival）的行为：autoSave 开着时，保存成功（noSubmit）就把作业
  * 标记为完成、继续下一章，从不因为覆盖率不足或题型不支持卡住整个流程。
@@ -6551,6 +6574,8 @@ const Runner = {
 
       this.stats.total = questions.length;
       UI.setStatus('running', '共 ' + questions.length + ' 题，正在请求答案…');
+      // 让大页面右下角的横条显示进度（答题在 iframe 里，横条在父页面）
+      updateWorkBar('📋 开始答题：共 ' + questions.length + ' 题');
 
       if (this.unsupported.length) {
         log('⚠️ 卷面含脚本不支持的题型：' + this.unsupported.join('、'), 'warn');
@@ -6744,6 +6769,7 @@ const Runner = {
           // 标清答案来源：题库/缓存是"标准答案"，模型是"推理结果"，两者可信度不同
           const src = r.fromBank ? '题库' : (r.cached ? '缓存' : '模型 ' + r.ans.confidence.toFixed(2));
           log('第 ' + (i + 1) + ' 题 ✓ ' + truncateText(q.stem) + ' → ' + shown + '（' + src + '）', 'success');
+          updateWorkBar('📋 答题中 ' + this.stats.answered + '/' + this.stats.total + ' 题');
         } else {
           this.stats.failed++;
           log('第 ' + (i + 1) + ' 题点击未生效，可能是页面结构不匹配', 'warn');
@@ -6917,8 +6943,10 @@ const Runner = {
         // 这类题的答案留在页面上，想补随时回来补。
         log('已保存。按原脚本行为：保存即视为本节作业完成，继续刷课', 'info');
         UI.setStatus('done', '已保存（' + this.unsupported.join('、') + '待手动补），继续');
+        updateWorkBar('💾 已保存，继续下一节');
       } else {
         UI.setStatus('warn', saved ? '已保存（待手动补题）' : '已填写（未提交）');
+        updateWorkBar('⚠️ 作业未完成，已暂停');
       }
       this.lastResult = outcome;
       return;
@@ -6988,6 +7016,7 @@ const Runner = {
             if (okSubmit) {
               log('提交成功（页面已跳到批阅页/题目已清空）', 'success');
               UI.setStatus('done', '已提交');
+              updateWorkBar('✅ 已提交，作业完成');
               this.lastResult = { status: 'done', reason: '', rate: rate, saved: false, submitted: true };
             } else {
               log('15 秒内没有收到提交成功的信号（页面没跳转，题目还在）。按未提交处理', 'error');
@@ -7024,6 +7053,7 @@ const Runner = {
         if (okSubmitBtn) {
           log('提交成功（页面已跳到批阅页/题目已清空）', 'success');
           UI.setStatus('done', '已提交');
+          updateWorkBar('✅ 已提交，作业完成');
           this.lastResult = { status: 'done', reason: '', rate: rate, saved: false, submitted: true };
         } else {
           log('15 秒内没有收到提交成功的信号。按未提交处理', 'error');
@@ -7080,8 +7110,10 @@ const Runner = {
       log('已保存。按原脚本行为：保存即视为本节作业完成，继续刷课', 'info');
       log('没填上的 ' + (100 - rate).toFixed(1) + '% 多为脚本写不进的题型，可在页面上手动补', 'info');
       UI.setStatus('done', '已保存（未提交），继续');
+      updateWorkBar('💾 已保存，继续下一节');
     } else {
       UI.setStatus('warn', saved ? '已保存（未提交）' : '已填写（未保存）');
+      updateWorkBar('⚠️ 作业未完成，已暂停');
     }
     this.lastResult = outcome;
   },
@@ -7943,6 +7975,7 @@ const CoursePilot = {
           'box-shadow:0 4px 16px rgba(0,0,0,.35);overflow:hidden;';
 
         const bar = d.createElement('div');
+        bar.id = 'llmq-work-bar';
         bar.style.cssText = 'padding:6px 12px;font:13px/1.4 sans-serif;color:#1a5c9e;' +
           'background:#eaf3fc;cursor:pointer;user-select:none;white-space:nowrap;';
         bar.textContent = '📋 作业答题中…（点此展开 / 收起）';
