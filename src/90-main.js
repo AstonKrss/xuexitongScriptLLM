@@ -113,12 +113,18 @@ const Main = {
         try { if (d.querySelectorAll('input[type=radio],input[type=checkbox]').length >= 4) { found = d; break; } } catch (e) { /* 同上 */ }
       }
     }
-    // 3) 只有填空题的卷子
+    // 3) 只有填空题的卷子。⚠️ 判定必须收紧：input 要在题目容器（.TiMu/.Py-mian1）里。
+    // 课程学习页的顶层文本里常有"填空"二字，搜索框又恰好是 text input——
+    // 之前按"页面有'填空' + 有 text input"判，直接把课程页误判成答题页，
+    // 面板于是显示「开始答题」而不是「自动刷课」。
     if (!found) {
       for (const d of docs) {
         try {
-          const txt = d.body ? d.body.textContent : '';
-          if (/填空/.test(txt) && d.querySelectorAll('input[type=text]').length >= 1) { found = d; break; }
+          const boxes = d.querySelectorAll('.TiMu, .Py-mian1');
+          for (const box of boxes) {
+            if (box.querySelector('input[type=text]')) { found = d; break; }
+          }
+          if (found) break;
         } catch (e) { /* 同上 */ }
       }
     }
@@ -135,15 +141,33 @@ const Main = {
    */
   startProbing() {
     let tries = 0;
+    let falseQuizRounds = 0;
     const tick = () => {
       tries++;
       const doc = this.resolveQuizDoc(true);
 
       if (this.quizKind === 'quiz') {
-        UI.setPageKind('quiz');
-        const where = doc === document ? '当前页面' : '页面内的 iframe';
-        log('在' + where + '里找到题目内容', 'success');
-        this.reportQuestions(doc);
+        // 结构像答题页 ≠ 真有题。课程页文本含"填空"+ 搜索框这类误判，
+        // 解析出来 0 题时不能锁死在这里，否则面板永远显示「开始答题」、
+        // 「自动刷课」出不来。继续探测，多轮无题就回退成非答题页。
+        const r = (() => {
+          try { return Parser.parse(doc); } catch (e) { return { questions: [] }; }
+        })();
+        if (r.questions.length > 0) {
+          UI.setPageKind('quiz');
+          const where = doc === document ? '当前页面' : '页面内的 iframe';
+          log('在' + where + '里找到题目内容', 'success');
+          this.reportQuestions(r);
+          return;
+        }
+        falseQuizRounds++;
+        log('第 ' + tries + ' 次探测：结构像答题页但没解析到题（可能是误判），继续…', 'info');
+        if (tries < 6) { setTimeout(tick, 2000); return; }
+        // 多轮都无题：按非答题页处理
+        this.quizKind = 'other';
+        UI.setPageKind('other');
+        UI.setStatus('idle', '非答题页');
+        log('多次探测都没解析到题目，已按课程页处理，可以直接用「自动刷课」', 'warn');
         return;
       }
 
@@ -159,9 +183,8 @@ const Main = {
     setTimeout(tick, 1200);
   },
 
-  reportQuestions(doc) {
+  reportQuestions(r) {
     try {
-      const r = Parser.parse(doc);
       if (r.questions.length) {
         UI.setStatus('idle', '识别到 ' + r.questions.length + ' 题');
         log('识别到 ' + r.questions.length + ' 道题（解析器：' + (r.adapter || '仅填空') + '）', 'success');
