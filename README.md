@@ -22,7 +22,7 @@
 | 服务商 | 适合谁 | 备注 |
 |--------|--------|------|
 | **DeepSeek** | 大多数人 | 中文选择题稳，价格低 |
-| **智谱 GLM** | 想低成本的 | 默认 `glm-4.7-flash` |
+| **智谱 GLM** | 追求效果优先的 | 默认 `glm-5.3` |
 | **阿里百炼** | 有阿里云账号的 | 走 OpenAI 兼容模式 |
 | **Kimi** | 有 Moonshot key 的 | 不支持 JSON 模式，走提示词约束 |
 | **OpenCode Zen** | 已有 Zen key 的 | ⚠️ 只有 GLM/Kimi/Big Pickle 这类能用，GPT 和 Claude 走别的协议，填了会 404 |
