@@ -304,10 +304,12 @@ const FontDecoder = {
 
     const chars = Array.from(this.collectEncryptedChars(doc));
     const table = getCxGlyphMap();
+    const extra = gmGet("llmq:glyphExtra", {}) || {};
     const map = new Map();
     let matched = 0;
     let missed = 0;
     let notInFont = 0;
+    const missedList = [];
 
     for (const ch of chars) {
       const cp = ch.codePointAt(0);
@@ -318,7 +320,8 @@ const FontDecoder = {
       let path;
       try { path = Typr.U.glyphToPath(font, gid); } catch (e) { continue; }
       const key = md5Hex(JSON.stringify(path)).slice(24);
-      const real = table.get(key);
+      // 先查内置对照表，再查用户扩展表（视觉模型识别成功后写入并持久化）
+      const real = table.get(key) || (extra[key] || null);
       if (real) {
         const to = String.fromCharCode(real);
         map.set(ch, to);
@@ -326,10 +329,13 @@ const FontDecoder = {
         if (this.samples.length < 40) this.samples.push({ from: ch, to: to });
       } else {
         missed++;
+        missedList.push({ key: key, ch: ch });
       }
     }
 
     this.stats = { chars: chars.length, matched: matched, missed: missed, notInFont: notInFont };
+    this.missedGlyphs = missedList;
+    this.fontBytes = bytes;
     this.map = map;
 
     // 一个都查不到 → 表和这套字体对不上（超星换了字形，或表版本过旧）
@@ -356,6 +362,122 @@ const FontDecoder = {
       log('页面虽然有 font-cxsecret 标记，但文字没有被替换，无需解码', 'info');
     }
     return true;
+  },
+
+  /* ---------- 视觉模型识别未收录字形 ----------
+   * 原理：解码表没收录的字形，用 FontFace API 把加密字体挂到文档上，
+   * 把乱码字符渲染成小图，发给多模态模型认字——模型看到的就是
+   * 用户屏幕上看到的字形。识别结果写进扩展对照表并持久化，
+   * 以后所有页面遇到同一字形直接查表，不再重复请求。 */
+
+  /** 把乱码字符渲染成 png dataURL。需要先用 loadFontFace 挂好字体 */
+  glyphImageDataUrl(ch, size) {
+    size = size || 96;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#000000';
+    ctx.font = Math.floor(size * 0.72) + 'px cx-llmq-glyph';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(ch, size / 2, size / 2);
+    return c.toDataURL('image/png');
+  },
+
+  /** 用 FontFace 把解码用的字体字节挂到当前文档（幂等） */
+  async loadFontFace() {
+    if (this._ffLoaded) return true;
+    if (!this.fontBytes || !this.fontBytes.length) return false;
+    try {
+      const ab = this.fontBytes.buffer.slice(this.fontBytes.byteOffset, this.fontBytes.byteOffset + this.fontBytes.byteLength);
+      const ff = new FontFace('cx-llmq-glyph', ab);
+      await ff.load();
+      document.fonts.add(ff);
+      this._ffLoaded = true;
+      return true;
+    } catch (e) {
+      log('挂载加密字体失败：' + e.message, 'warn');
+      return false;
+    }
+  },
+
+  /**
+   * 把未收录字形发给视觉模型认字，识别成功写入扩展对照表并持久化。
+   * @param {object} opts { model, baseUrl, apiKey, onProgress }
+   * @returns {Promise<{identified:number, failed:number}>}
+   */
+  async identifyMissedGlyphs(opts) {
+    opts = opts || {};
+    const missed = this.missedGlyphs || [];
+    if (!missed.length) return { identified: 0, failed: 0 };
+    if (!opts.model) return { identified: 0, failed: missed.length };
+    if (!(await this.loadFontFace())) return { identified: 0, failed: missed.length };
+
+    const extra = gmGet('llmq:glyphExtra', {}) || {};
+    let identified = 0, failed = 0;
+
+    for (let i = 0; i < missed.length; i++) {
+      if (this.stopGlyphScan) break;
+      const g = missed[i];
+      if (extra[g.key]) { identified++; continue; }   // 以前识别过的直接用
+      try {
+        const dataUrl = this.glyphImageDataUrl(g.ch);
+        const code = await new Promise((resolve) => {
+          gmRequest({
+            method: 'POST',
+            timeout: 30000,
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + (opts.apiKey || ''),
+            },
+            data: JSON.stringify({
+              model: opts.model,
+              messages: [{
+                role: 'user',
+                content: [
+                  { type: 'text', text: '图中是一个中文汉字（可能是生僻字或常用字）。只回答这一个汉字本身，不要解释、不要标点。' },
+                  { type: 'image_url', image_url: { url: dataUrl } },
+                ],
+              }],
+              temperature: 0,
+            }),
+            onload(res) {
+              try {
+                const j = JSON.parse(res.responseText);
+                const text = String((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
+                const ch = text.replace(/[^\u4e00-\u9fa5]/g, '').charAt(0);
+                resolve(ch || null);
+              } catch (e) { resolve(null); }
+            },
+            onerror() { resolve(null); },
+            ontimeout() { resolve(null); },
+          });
+        });
+        if (code) {
+          const cp = code.codePointAt(0);
+          const real = String.fromCharCode(cp);
+          this.map.set(g.ch, real);
+          extra[g.key] = cp;
+          gmSet('llmq:glyphExtra', extra);
+          identified++;
+          if (this.samples.length < 40) this.samples.push({ from: g.ch, to: real });
+          log('视觉识别：' + g.ch + ' → ' + real + '（已写入本地对照表）', 'success');
+        } else {
+          failed++;
+          log('视觉模型没能认出字形 ' + g.ch, 'warn');
+        }
+      } catch (e) {
+        failed++;
+        log('字形识别异常：' + e.message, 'warn');
+      }
+      if (typeof opts.onProgress === 'function') {
+        try { opts.onProgress((i + 1) + '/' + missed.length); } catch (e) { /* 忽略 */ }
+      }
+    }
+    this.stats.missed = Math.max(0, missed.length - identified);
+    return { identified: identified, failed: failed };
   },
 
   /* ---------- 对外 ---------- */

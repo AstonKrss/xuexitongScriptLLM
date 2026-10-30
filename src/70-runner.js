@@ -557,6 +557,18 @@ const Runner = {
         UI.setStatus('running', '正在准备字体解码…');
         const ready = await FontDecoder.ensureReady(doc, (t) => UI.setStatus('running', t));
         if (!ready) log('字体解码不可用：' + FontDecoder.failedReason + '，将使用原始文本', 'warn');
+        // 对照表没收录的字形：配置了视觉模型就用它认字，识别结果持久化，
+        // 以后所有页面遇到同一字形直接查表。没配就按乱码处理（日志会标注哪些题受影响）。
+        if (ready && cfg.visionModel && FontDecoder.stats && FontDecoder.stats.missed > 0) {
+          log('有 ' + FontDecoder.stats.missed + ' 个字形不在对照表里，用视觉模型识别（' + cfg.visionModel + '）…', 'info');
+          const r = await FontDecoder.identifyMissedGlyphs({
+            model: cfg.visionModel,
+            apiKey: profile.apiKey,
+            onProgress: (t) => UI.setStatus('running', '识别字形 ' + t),
+          });
+          log('字形识别完成：新增 ' + r.identified + ' 个，未识别 ' + r.failed + ' 个' +
+            (r.identified ? '（已持久化，下次同字形直接查表）' : ''), r.identified ? 'success' : 'warn');
+        }
       }
 
       const parsed = Parser.parse(doc, { decodeFont: !!cfg.decodeFont });

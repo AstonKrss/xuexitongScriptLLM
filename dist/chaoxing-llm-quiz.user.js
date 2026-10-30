@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.5.5
+// @version      1.6.0
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.5.5';
+const VERSION = '1.6.0';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -3400,6 +3400,7 @@ const DEFAULT_CONFIG = {
     minConfidence: 0.5,      // 低于此置信度视为"没把握"，不填入答案
     minAnswerRate: 90,       // 作答覆盖率下限（百分比），达到才允许提交。90：个别点击失效的题不至于卡住整卷——空着不交损失更大
     guessOnMiss: true,       // 没匹配到答案时按题型猜默认值（单选 B / 多选全选 / 判断错），凑满覆盖率
+    visionModel: '',         // 视觉模型：解码表没收录的字形渲染成图发给它认字（如 glm-4.6v-flash）。留空关闭
     autoSubmit: true,        // 达到覆盖率下限后自动提交
     autoSave: true,          // 未达下限时自动保存，保留已填答案
     useCache: true,          // 命中本地题库直接复用，不消耗 token
@@ -5451,10 +5452,12 @@ const FontDecoder = {
 
     const chars = Array.from(this.collectEncryptedChars(doc));
     const table = getCxGlyphMap();
+    const extra = gmGet("llmq:glyphExtra", {}) || {};
     const map = new Map();
     let matched = 0;
     let missed = 0;
     let notInFont = 0;
+    const missedList = [];
 
     for (const ch of chars) {
       const cp = ch.codePointAt(0);
@@ -5465,7 +5468,8 @@ const FontDecoder = {
       let path;
       try { path = Typr.U.glyphToPath(font, gid); } catch (e) { continue; }
       const key = md5Hex(JSON.stringify(path)).slice(24);
-      const real = table.get(key);
+      // 先查内置对照表，再查用户扩展表（视觉模型识别成功后写入并持久化）
+      const real = table.get(key) || (extra[key] || null);
       if (real) {
         const to = String.fromCharCode(real);
         map.set(ch, to);
@@ -5473,10 +5477,13 @@ const FontDecoder = {
         if (this.samples.length < 40) this.samples.push({ from: ch, to: to });
       } else {
         missed++;
+        missedList.push({ key: key, ch: ch });
       }
     }
 
     this.stats = { chars: chars.length, matched: matched, missed: missed, notInFont: notInFont };
+    this.missedGlyphs = missedList;
+    this.fontBytes = bytes;
     this.map = map;
 
     // 一个都查不到 → 表和这套字体对不上（超星换了字形，或表版本过旧）
@@ -5503,6 +5510,122 @@ const FontDecoder = {
       log('页面虽然有 font-cxsecret 标记，但文字没有被替换，无需解码', 'info');
     }
     return true;
+  },
+
+  /* ---------- 视觉模型识别未收录字形 ----------
+   * 原理：解码表没收录的字形，用 FontFace API 把加密字体挂到文档上，
+   * 把乱码字符渲染成小图，发给多模态模型认字——模型看到的就是
+   * 用户屏幕上看到的字形。识别结果写进扩展对照表并持久化，
+   * 以后所有页面遇到同一字形直接查表，不再重复请求。 */
+
+  /** 把乱码字符渲染成 png dataURL。需要先用 loadFontFace 挂好字体 */
+  glyphImageDataUrl(ch, size) {
+    size = size || 96;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#000000';
+    ctx.font = Math.floor(size * 0.72) + 'px cx-llmq-glyph';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(ch, size / 2, size / 2);
+    return c.toDataURL('image/png');
+  },
+
+  /** 用 FontFace 把解码用的字体字节挂到当前文档（幂等） */
+  async loadFontFace() {
+    if (this._ffLoaded) return true;
+    if (!this.fontBytes || !this.fontBytes.length) return false;
+    try {
+      const ab = this.fontBytes.buffer.slice(this.fontBytes.byteOffset, this.fontBytes.byteOffset + this.fontBytes.byteLength);
+      const ff = new FontFace('cx-llmq-glyph', ab);
+      await ff.load();
+      document.fonts.add(ff);
+      this._ffLoaded = true;
+      return true;
+    } catch (e) {
+      log('挂载加密字体失败：' + e.message, 'warn');
+      return false;
+    }
+  },
+
+  /**
+   * 把未收录字形发给视觉模型认字，识别成功写入扩展对照表并持久化。
+   * @param {object} opts { model, baseUrl, apiKey, onProgress }
+   * @returns {Promise<{identified:number, failed:number}>}
+   */
+  async identifyMissedGlyphs(opts) {
+    opts = opts || {};
+    const missed = this.missedGlyphs || [];
+    if (!missed.length) return { identified: 0, failed: 0 };
+    if (!opts.model) return { identified: 0, failed: missed.length };
+    if (!(await this.loadFontFace())) return { identified: 0, failed: missed.length };
+
+    const extra = gmGet('llmq:glyphExtra', {}) || {};
+    let identified = 0, failed = 0;
+
+    for (let i = 0; i < missed.length; i++) {
+      if (this.stopGlyphScan) break;
+      const g = missed[i];
+      if (extra[g.key]) { identified++; continue; }   // 以前识别过的直接用
+      try {
+        const dataUrl = this.glyphImageDataUrl(g.ch);
+        const code = await new Promise((resolve) => {
+          gmRequest({
+            method: 'POST',
+            timeout: 30000,
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + (opts.apiKey || ''),
+            },
+            data: JSON.stringify({
+              model: opts.model,
+              messages: [{
+                role: 'user',
+                content: [
+                  { type: 'text', text: '图中是一个中文汉字（可能是生僻字或常用字）。只回答这一个汉字本身，不要解释、不要标点。' },
+                  { type: 'image_url', image_url: { url: dataUrl } },
+                ],
+              }],
+              temperature: 0,
+            }),
+            onload(res) {
+              try {
+                const j = JSON.parse(res.responseText);
+                const text = String((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
+                const ch = text.replace(/[^\u4e00-\u9fa5]/g, '').charAt(0);
+                resolve(ch || null);
+              } catch (e) { resolve(null); }
+            },
+            onerror() { resolve(null); },
+            ontimeout() { resolve(null); },
+          });
+        });
+        if (code) {
+          const cp = code.codePointAt(0);
+          const real = String.fromCharCode(cp);
+          this.map.set(g.ch, real);
+          extra[g.key] = cp;
+          gmSet('llmq:glyphExtra', extra);
+          identified++;
+          if (this.samples.length < 40) this.samples.push({ from: g.ch, to: real });
+          log('视觉识别：' + g.ch + ' → ' + real + '（已写入本地对照表）', 'success');
+        } else {
+          failed++;
+          log('视觉模型没能认出字形 ' + g.ch, 'warn');
+        }
+      } catch (e) {
+        failed++;
+        log('字形识别异常：' + e.message, 'warn');
+      }
+      if (typeof opts.onProgress === 'function') {
+        try { opts.onProgress((i + 1) + '/' + missed.length); } catch (e) { /* 忽略 */ }
+      }
+    }
+    this.stats.missed = Math.max(0, missed.length - identified);
+    return { identified: identified, failed: failed };
   },
 
   /* ---------- 对外 ---------- */
@@ -6365,6 +6488,18 @@ const Runner = {
         UI.setStatus('running', '正在准备字体解码…');
         const ready = await FontDecoder.ensureReady(doc, (t) => UI.setStatus('running', t));
         if (!ready) log('字体解码不可用：' + FontDecoder.failedReason + '，将使用原始文本', 'warn');
+        // 对照表没收录的字形：配置了视觉模型就用它认字，识别结果持久化，
+        // 以后所有页面遇到同一字形直接查表。没配就按乱码处理（日志会标注哪些题受影响）。
+        if (ready && cfg.visionModel && FontDecoder.stats && FontDecoder.stats.missed > 0) {
+          log('有 ' + FontDecoder.stats.missed + ' 个字形不在对照表里，用视觉模型识别（' + cfg.visionModel + '）…', 'info');
+          const r = await FontDecoder.identifyMissedGlyphs({
+            model: cfg.visionModel,
+            apiKey: profile.apiKey,
+            onProgress: (t) => UI.setStatus('running', '识别字形 ' + t),
+          });
+          log('字形识别完成：新增 ' + r.identified + ' 个，未识别 ' + r.failed + ' 个' +
+            (r.identified ? '（已持久化，下次同字形直接查表）' : ''), r.identified ? 'success' : 'warn');
+        }
       }
 
       const parsed = Parser.parse(doc, { decodeFont: !!cfg.decodeFont });
@@ -8430,6 +8565,13 @@ const UI = {
     <div style="margin-top:8px">
       <label class="chk"><input type="checkbox" id="f-guess" checked> 没答案的题按默认猜（单选 B / 多选全选 / 判断错）</label>
     </div>
+    <div style="margin-top:8px">
+      <label>视觉模型（认乱码字形用，留空关闭）</label>
+      <input type="text" id="f-vision" placeholder="例：glm-4.6v-flash">
+    </div>
+    <div style="margin-top:8px">
+      <label class="chk">
+    </div>
     </div>
   </div>
   <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
@@ -8589,6 +8731,7 @@ const UI = {
       cfg.quiz.minConfidence = clampNum(q('#f-conf').value, 0, 1, 0.5);
       cfg.quiz.minAnswerRate = clampNum(q('#f-rate').value, 0, 100, 90);
       cfg.quiz.guessOnMiss = q('#f-guess').checked;
+      cfg.quiz.visionModel = (q('#f-vision').value || '').trim();
       // 三档合成两个布尔，配置结构保持兼容（旧配置不需要迁移）
       const finishMode = q('#f-finish').value;
       cfg.quiz.autoSave = finishMode !== 'manual';
@@ -8745,6 +8888,7 @@ const UI = {
     q('#f-conf').value = quiz.minConfidence;
     q('#f-rate').value = quiz.minAnswerRate;
     q('#f-guess').checked = quiz.guessOnMiss !== false;
+    q('#f-vision').value = quiz.visionModel || '';
     // 两个布尔反推三档：都不做=手动，只保存=保存，两者都开=提交
     q('#f-finish').value = quiz.autoSubmit ? 'submit' : (quiz.autoSave ? 'save' : 'manual');
     q('#f-cache').checked = !!quiz.useCache;

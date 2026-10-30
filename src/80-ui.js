@@ -287,6 +287,13 @@ const UI = {
     <div style="margin-top:8px">
       <label class="chk"><input type="checkbox" id="f-guess" checked> 没答案的题按默认猜（单选 B / 多选全选 / 判断错）</label>
     </div>
+    <div style="margin-top:8px">
+      <label>视觉模型（认乱码字形用，留空关闭）</label>
+      <input type="text" id="f-vision" placeholder="例：glm-4.6v-flash">
+    </div>
+    <div style="margin-top:8px">
+      <label class="chk">
+    </div>
     </div>
   </div>
   <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
@@ -446,6 +453,7 @@ const UI = {
       cfg.quiz.minConfidence = clampNum(q('#f-conf').value, 0, 1, 0.5);
       cfg.quiz.minAnswerRate = clampNum(q('#f-rate').value, 0, 100, 90);
       cfg.quiz.guessOnMiss = q('#f-guess').checked;
+      cfg.quiz.visionModel = (q('#f-vision').value || '').trim();
       // 三档合成两个布尔，配置结构保持兼容（旧配置不需要迁移）
       const finishMode = q('#f-finish').value;
       cfg.quiz.autoSave = finishMode !== 'manual';
@@ -602,6 +610,7 @@ const UI = {
     q('#f-conf').value = quiz.minConfidence;
     q('#f-rate').value = quiz.minAnswerRate;
     q('#f-guess').checked = quiz.guessOnMiss !== false;
+    q('#f-vision').value = quiz.visionModel || '';
     // 两个布尔反推三档：都不做=手动，只保存=保存，两者都开=提交
     q('#f-finish').value = quiz.autoSubmit ? 'submit' : (quiz.autoSave ? 'save' : 'manual');
     q('#f-cache').checked = !!quiz.useCache;
