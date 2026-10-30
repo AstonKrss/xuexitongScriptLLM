@@ -724,6 +724,16 @@ const Runner = {
           // 照原脚本精神：从不空着。模型没把握也比空着强——空着必错，
           // 填了还有概率对，而且覆盖率能到提交门槛。日志标明让用户可复核。
           log('第 ' + (i + 1) + ' 题把握不足（置信度 ' + r.ans.confidence.toFixed(2) + '），仍填入答案，可在页面上改', 'warn');
+          // 把握不足时顺手查一下题干是否残留加密字符：模型读到的乱码
+          // 正是低把握的常见来源——你屏幕上显示的是正常字（字体渲染回的），
+          // 但 DOM 里发给模型的是乱码。检测出来你就能人工复核这题。
+          if (typeof findSuspiciousChars === 'function') {
+            const sus = findSuspiciousChars(q.stem + ' ' + q.options.map((o) => o.text || '').join(' '));
+            if (sus.length) {
+              log('   该题文本仍含 ' + sus.length + ' 个未还原的加密字符（' + sus.slice(0, 6).join(' ') +
+                '），模型读到的就是这种乱码——建议人工复核这题', 'error');
+            }
+          }
         }
 
         // 单选题/判断题只点一个；多选题要把该点的点上、不该点的点掉

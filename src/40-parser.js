@@ -687,6 +687,22 @@ function collectBlankQuestions(doc) {
   return out;
 }
 
+/** 找出文本中的可疑字符：字体加密的替换字通常落在 PUA 私有区或 CJK 扩展区，
+ *  正常中文题目不该出现这些。解码表没覆盖到的字符会残留在这里，
+ *  模型读到这类字符时把握度会骤降——逐题把它暴露出来。
+ *  @returns {Array<string>} 去重后的可疑字符 */
+function findSuspiciousChars(text) {
+  if (!text) return [];
+  const out = [];
+  for (const ch of String(text)) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0xE000 && c <= 0xF8FF) || (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x20000 && c <= 0x2A6DF)) {
+      if (out.indexOf(ch) < 0) out.push(ch);
+    }
+  }
+  return out;
+}
+
 /**
  * 检测字体加密。超星用 .font-cxsecret 把文字替换成同形的生僻字，
  * 靠自定义字体渲染回正常字形——人看着没问题，但 DOM 里取到的文本是乱的。

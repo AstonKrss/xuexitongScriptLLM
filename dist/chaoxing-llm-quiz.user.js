@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.5.4
+// @version      1.5.5
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.5.4';
+const VERSION = '1.5.5';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -4864,6 +4864,22 @@ function collectBlankQuestions(doc) {
   return out;
 }
 
+/** 找出文本中的可疑字符：字体加密的替换字通常落在 PUA 私有区或 CJK 扩展区，
+ *  正常中文题目不该出现这些。解码表没覆盖到的字符会残留在这里，
+ *  模型读到这类字符时把握度会骤降——逐题把它暴露出来。
+ *  @returns {Array<string>} 去重后的可疑字符 */
+function findSuspiciousChars(text) {
+  if (!text) return [];
+  const out = [];
+  for (const ch of String(text)) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0xE000 && c <= 0xF8FF) || (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x20000 && c <= 0x2A6DF)) {
+      if (out.indexOf(ch) < 0) out.push(ch);
+    }
+  }
+  return out;
+}
+
 /**
  * 检测字体加密。超星用 .font-cxsecret 把文字替换成同形的生僻字，
  * 靠自定义字体渲染回正常字形——人看着没问题，但 DOM 里取到的文本是乱的。
@@ -6516,6 +6532,16 @@ const Runner = {
           // 照原脚本精神：从不空着。模型没把握也比空着强——空着必错，
           // 填了还有概率对，而且覆盖率能到提交门槛。日志标明让用户可复核。
           log('第 ' + (i + 1) + ' 题把握不足（置信度 ' + r.ans.confidence.toFixed(2) + '），仍填入答案，可在页面上改', 'warn');
+          // 把握不足时顺手查一下题干是否残留加密字符：模型读到的乱码
+          // 正是低把握的常见来源——你屏幕上显示的是正常字（字体渲染回的），
+          // 但 DOM 里发给模型的是乱码。检测出来你就能人工复核这题。
+          if (typeof findSuspiciousChars === 'function') {
+            const sus = findSuspiciousChars(q.stem + ' ' + q.options.map((o) => o.text || '').join(' '));
+            if (sus.length) {
+              log('   该题文本仍含 ' + sus.length + ' 个未还原的加密字符（' + sus.slice(0, 6).join(' ') +
+                '），模型读到的就是这种乱码——建议人工复核这题', 'error');
+            }
+          }
         }
 
         // 单选题/判断题只点一个；多选题要把该点的点上、不该点的点掉
