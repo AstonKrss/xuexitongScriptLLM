@@ -95,6 +95,31 @@ function waitFor(cond, timeout, interval) {
   });
 }
 
+/**
+ * 保存之后这份作业算"完成"还是"未完成"——刷课跳不跳下一节就看它。
+ * 原脚本（unrival）的行为：autoSave 开着时，保存成功（noSubmit）就把作业
+ * 标记为完成、继续下一章，从不因为覆盖率不足或题型不支持卡住整个流程。
+ * 本函数提炼出这个判定，两处调用点（覆盖率不足 / 含不支持题型）共用，
+ * 也让测试能直接钉住"保存即继续"这个行为。
+ * @param {boolean} saved 保存是否成功
+ * @param {object} cfg quiz 配置（用 autoSave / minAnswerRate）
+ * @param {number} rate 覆盖率百分比
+ * @param {string[]} unsupported 卷面上脚本写不进的题型
+ * @returns {{status:string, reason:string, rate:number, saved:boolean, submitted:boolean}}
+ */
+function decideAfterSave(saved, cfg, rate, unsupported) {
+  const why = (unsupported && unsupported.length)
+    ? '有不支持题型已保存（原脚本行为：继续）'
+    : '覆盖率不足已保存（原脚本行为：继续）';
+  // 保存成功且配置允许自动保存 → 原脚本行为：完成，继续
+  if (saved && cfg.autoSave) return { status: 'done', reason: why, rate: rate, saved: true, submitted: false };
+  // 答案没落库 → 继续走会丢答案，必须停
+  const reason = (unsupported && unsupported.length)
+    ? '有脚本不支持的题型：' + unsupported.join('、')
+    : '覆盖率 ' + rate.toFixed(1) + '% 未达 ' + cfg.minAnswerRate + '%' + (saved ? '' : '，且保存失败');
+  return { status: 'incomplete', reason: reason, rate: rate, saved: saved, submitted: false };
+}
+
 /* ---------- 并发池 ---------- */
 // 注意：worker 内部必须自己吞掉异常，否则一个 reject 会让整个池子提前退出
 async function runPool(items, limit, worker) {
@@ -946,14 +971,18 @@ const Runner = {
     // 覆盖率是按"脚本认识的题"算的，填空题全空也能算出 100%，
     // 这时候提交等于交一张缺题的卷子。宁可留着让你手动补。
     if (this.unsupported.length) {
-      log('本次不提交：卷面还有 ' + this.unsupported.join('、') + ' 需要你手动完成', 'error');
+      log('卷面含脚本写不进的题型：' + this.unsupported.join('、'), 'warn');
       const saved = await this.trySave(doc, cfg);
-      UI.setStatus('warn', saved ? '已保存（待手动补题）' : '已填写（未提交）');
-      this.lastResult = {
-        status: 'incomplete',
-        reason: '有脚本不支持的题型：' + this.unsupported.join('、'),
-        rate: rate, saved: saved, submitted: false,
-      };
+      const outcome = decideAfterSave(saved, cfg, rate, this.unsupported);
+      if (outcome.status === 'done') {
+        // 原脚本同款：对填空/简答这类它处理不了的题，不答、保存、继续下一章。
+        // 这类题的答案留在页面上，想补随时回来补。
+        log('已保存。按原脚本行为：保存即视为本节作业完成，继续刷课', 'info');
+        UI.setStatus('done', '已保存（' + this.unsupported.join('、') + '待手动补），继续');
+      } else {
+        UI.setStatus('warn', saved ? '已保存（待手动补题）' : '已填写（未提交）');
+      }
+      this.lastResult = outcome;
       return;
     }
 
@@ -1104,12 +1133,19 @@ const Runner = {
 
     log('覆盖率 ' + rate.toFixed(1) + '% 未达 ' + cfg.minAnswerRate + '% 的提交门槛，先保存', 'warn');
     const saved = await this.trySave(doc, cfg);
-    UI.setStatus('warn', saved ? '已保存（未提交）' : '已填写（未保存）');
-    this.lastResult = {
-      status: 'incomplete',
-      reason: '覆盖率 ' + rate.toFixed(1) + '% 未达 ' + cfg.minAnswerRate + '%',
-      rate: rate, saved: saved, submitted: false,
-    };
+    const outcome = decideAfterSave(saved, cfg, rate, null);
+    if (outcome.status === 'done') {
+      // 原脚本同款行为：autoSave 开着时，保存成功就把这份作业标记为完成，
+      // 刷课继续下一章——它从不因为覆盖率不足而卡住整个流程。
+      // 没填满的题（通常是填空/简答这类脚本写不进的题型）答案还留在页面上，
+      // 随时可以回来手动补。之前这里按"未完成"处理，导致保存后停在原地。
+      log('已保存。按原脚本行为：保存即视为本节作业完成，继续刷课', 'info');
+      log('没填上的 ' + (100 - rate).toFixed(1) + '% 多为脚本写不进的题型，可在页面上手动补', 'info');
+      UI.setStatus('done', '已保存（未提交），继续');
+    } else {
+      UI.setStatus('warn', saved ? '已保存（未提交）' : '已填写（未保存）');
+    }
+    this.lastResult = outcome;
   },
 
   /**

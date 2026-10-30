@@ -96,7 +96,7 @@ function setup(withSubmit, opts) {
   const code = MODULES.map((f) => fs.readFileSync(path.join(SRC, f), 'utf8')).join('\n');
   const prefix = `var UI = { setStatus: function(){}, mount: function(){}, openSettings: function(){} };\nvar unsafeWindow = undefined;\n`;
   // eslint-disable-next-line no-new-func
-  const api = new Function(`${prefix}${code}\nreturn { Config, Runner, auditAnswerState, formatRanges, readAnswerValue, verifyChoiceValue, isOptionChecked, makeGuess: Runner.makeGuess };`)();
+  const api = new Function(`${prefix}${code}\nreturn { Config, Runner, auditAnswerState, formatRanges, readAnswerValue, verifyChoiceValue, isOptionChecked, makeGuess: Runner.makeGuess, decideAfterSave };`)();
 
   const cfg = api.Config.load();
   cfg.profiles.default.apiKey = 'sk-test';
@@ -344,6 +344,34 @@ function setup(withSubmit, opts) {
     ok(api.makeGuess(noB).length === 1, '没有 B 选项时退到第二个');
 
     ok(api.makeGuess(null) === null, '空输入安全');
+  }
+
+  /* ---------- 保存后的完成判定（原脚本行为：保存即继续） ---------- */
+  console.log('\n[保存后的完成判定]');
+
+  {
+    const { api } = setup(true, {});
+    const D = api.decideAfterSave;
+    const cfg = { autoSave: true, minAnswerRate: 90 };
+
+    // 1) 原脚本行为的核心：保存成功 + autoSave → 完成，刷课继续
+    const r1 = D(true, cfg, 88.3, null);
+    ok(r1.status === 'done', '★ 保存成功 + 自动保存 → done（原脚本行为，不再卡在原地）');
+    ok(r1.submitted === false && r1.saved === true, 'done 但标记未提交、已保存');
+
+    // 2) 卷面含填空/简答这类写不进的题型 → 同样保存即继续
+    const r2 = D(true, cfg, 53, ['填空题']);
+    ok(r2.status === 'done', '★ 含不支持题型 + 已保存 → done（原脚本从不为此卡流程）');
+
+    // 3) 保存失败 → 答案没落库，必须停
+    const r3 = D(false, cfg, 88.3, null);
+    ok(r3.status === 'incomplete', '保存失败 → incomplete（继续会丢答案）');
+    ok(/保存失败/.test(r3.reason), '失败原因写明保存没成功');
+
+    // 4) 关掉自动保存 → 不代做决定，停下等用户
+    const cfgNoSave = { autoSave: false, minAnswerRate: 90 };
+    const r4 = D(true, cfgNoSave, 88.3, null);
+    ok(r4.status === 'incomplete', 'autoSave 关闭 → 即使点了保存也不算完成');
   }
 
   console.log(`\n${'─'.repeat(44)}`);
