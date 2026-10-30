@@ -284,6 +284,10 @@ const UI = {
       <label>覆盖率下限(%)</label>
       <input type="number" id="f-rate" min="0" max="100" step="5">
     </div>
+    <div style="margin-top:8px">
+      <label class="chk"><input type="checkbox" id="f-guess" checked> 没答案的题按默认猜（单选 B / 多选全选 / 判断错）</label>
+    </div>
+    </div>
   </div>
   <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
 
@@ -440,7 +444,8 @@ const UI = {
       cfg.quiz.concurrency = clampNum(q('#f-conc').value, 1, 10, 3);
       cfg.quiz.timeoutMs = clampNum(q('#f-timeout').value, 2000, 60000, 25000);
       cfg.quiz.minConfidence = clampNum(q('#f-conf').value, 0, 1, 0.5);
-      cfg.quiz.minAnswerRate = clampNum(q('#f-rate').value, 0, 100, 100);
+      cfg.quiz.minAnswerRate = clampNum(q('#f-rate').value, 0, 100, 90);
+      cfg.quiz.guessOnMiss = q('#f-guess').checked;
       // 三档合成两个布尔，配置结构保持兼容（旧配置不需要迁移）
       const finishMode = q('#f-finish').value;
       cfg.quiz.autoSave = finishMode !== 'manual';
@@ -596,6 +601,7 @@ const UI = {
     q('#f-timeout').value = quiz.timeoutMs;
     q('#f-conf').value = quiz.minConfidence;
     q('#f-rate').value = quiz.minAnswerRate;
+    q('#f-guess').checked = quiz.guessOnMiss !== false;
     // 两个布尔反推三档：都不做=手动，只保存=保存，两者都开=提交
     q('#f-finish').value = quiz.autoSubmit ? 'submit' : (quiz.autoSave ? 'save' : 'manual');
     q('#f-cache').checked = !!quiz.useCache;

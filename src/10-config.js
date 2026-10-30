@@ -116,7 +116,8 @@ const DEFAULT_CONFIG = {
     temperature: 0,          // 答题要确定性，不要创造力
     maxTokens: 300,          // 答案 JSON 很短，给多了反而容易让模型自由发挥
     minConfidence: 0.5,      // 低于此置信度视为"没把握"，不填入答案
-    minAnswerRate: 100,      // 作答覆盖率下限（百分比），达到才允许提交。注意这不是正确率
+    minAnswerRate: 90,       // 作答覆盖率下限（百分比），达到才允许提交。90：个别点击失效的题不至于卡住整卷——空着不交损失更大
+    guessOnMiss: true,       // 没匹配到答案时按题型猜默认值（单选 B / 多选全选 / 判断错），凑满覆盖率
     autoSubmit: true,        // 达到覆盖率下限后自动提交
     autoSave: true,          // 未达下限时自动保存，保留已填答案
     useCache: true,          // 命中本地题库直接复用，不消耗 token

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.4.4
+// @version      1.5.1
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.4.4';
+const VERSION = '1.5.1';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -3398,7 +3398,8 @@ const DEFAULT_CONFIG = {
     temperature: 0,          // 答题要确定性，不要创造力
     maxTokens: 300,          // 答案 JSON 很短，给多了反而容易让模型自由发挥
     minConfidence: 0.5,      // 低于此置信度视为"没把握"，不填入答案
-    minAnswerRate: 100,      // 作答覆盖率下限（百分比），达到才允许提交。注意这不是正确率
+    minAnswerRate: 90,       // 作答覆盖率下限（百分比），达到才允许提交。90：个别点击失效的题不至于卡住整卷——空着不交损失更大
+    guessOnMiss: true,       // 没匹配到答案时按题型猜默认值（单选 B / 多选全选 / 判断错），凑满覆盖率
     autoSubmit: true,        // 达到覆盖率下限后自动提交
     autoSave: true,          // 未达下限时自动保存，保留已填答案
     useCache: true,          // 命中本地题库直接复用，不消耗 token
@@ -6495,14 +6496,26 @@ const Runner = {
         }
 
         if (!r.match) {
-          this.stats.skipped++;
-          log('第 ' + (i + 1) + ' 题没有匹配上选项，跳过（' + truncateText(q.stem) + '）', 'warn');
-          continue;
+          // 猜题兜底（学原脚本的 randomDo）：模型没答案时按题型猜一个默认值。
+          // 空着提交 = 那题 0 分；猜一个 = 至少有概率得分，而且覆盖率能到提交门槛。
+          // 日志里明确标注"猜的"，用户可以回头改。
+          if (cfg.guessOnMiss) {
+            const guess = this.makeGuess(q);
+            if (guess) {
+              r.match = { options: guess };
+              log('第 ' + (i + 1) + ' 题没有匹配到答案，按默认猜测（可在页面上改）', 'warn');
+            }
+          }
+          if (!r.match) {
+            this.stats.skipped++;
+            log('第 ' + (i + 1) + ' 题没有匹配上选项，跳过（' + truncateText(q.stem) + '）', 'warn');
+            continue;
+          }
         }
         if (r.ans.confidence < cfg.minConfidence) {
-          this.stats.skipped++;
-          log('第 ' + (i + 1) + ' 题把握不足（置信度 ' + r.ans.confidence.toFixed(2) + '），跳过', 'warn');
-          continue;
+          // 照原脚本精神：从不空着。模型没把握也比空着强——空着必错，
+          // 填了还有概率对，而且覆盖率能到提交门槛。日志标明让用户可复核。
+          log('第 ' + (i + 1) + ' 题把握不足（置信度 ' + r.ans.confidence.toFixed(2) + '），仍填入答案，可在页面上改', 'warn');
         }
 
         // 单选题/判断题只点一个；多选题要把该点的点上、不该点的点掉
@@ -6654,6 +6667,20 @@ const Runner = {
       };
       tick();
     });
+  },
+
+  /** 猜题兜底：模型没答案时按题型给一个默认答案（学原脚本的 randomDo）。
+   *  单选选 B、多选全选、判断选"错"——和原脚本同款。
+   *  @returns {Array<Element>|null} 选中的选项元素 */
+  makeGuess(q) {
+    if (!q || !q.options || !q.options.length) return null;
+    if (q.type === 'multi') return q.options.slice();                       // 多选：全选
+    if (q.type === 'judge') {
+      const wrong = q.options.find((o) => /错|否|×|✗|false/i.test(o.text || ''));
+      return wrong ? [wrong] : null;                                        // 判断：选"错"
+    }
+    const b = q.options.find((o) => o.key === 'B');
+    return b ? [b] : (q.options[1] || q.options[0] ? [q.options[1] || q.options[0]] : null);  // 单选：B
   },
 
   async finish(cfg) {
@@ -8323,6 +8350,10 @@ const UI = {
       <label>覆盖率下限(%)</label>
       <input type="number" id="f-rate" min="0" max="100" step="5">
     </div>
+    <div style="margin-top:8px">
+      <label class="chk"><input type="checkbox" id="f-guess" checked> 没答案的题按默认猜（单选 B / 多选全选 / 判断错）</label>
+    </div>
+    </div>
   </div>
   <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
 
@@ -8479,7 +8510,8 @@ const UI = {
       cfg.quiz.concurrency = clampNum(q('#f-conc').value, 1, 10, 3);
       cfg.quiz.timeoutMs = clampNum(q('#f-timeout').value, 2000, 60000, 25000);
       cfg.quiz.minConfidence = clampNum(q('#f-conf').value, 0, 1, 0.5);
-      cfg.quiz.minAnswerRate = clampNum(q('#f-rate').value, 0, 100, 100);
+      cfg.quiz.minAnswerRate = clampNum(q('#f-rate').value, 0, 100, 90);
+      cfg.quiz.guessOnMiss = q('#f-guess').checked;
       // 三档合成两个布尔，配置结构保持兼容（旧配置不需要迁移）
       const finishMode = q('#f-finish').value;
       cfg.quiz.autoSave = finishMode !== 'manual';
@@ -8635,6 +8667,7 @@ const UI = {
     q('#f-timeout').value = quiz.timeoutMs;
     q('#f-conf').value = quiz.minConfidence;
     q('#f-rate').value = quiz.minAnswerRate;
+    q('#f-guess').checked = quiz.guessOnMiss !== false;
     // 两个布尔反推三档：都不做=手动，只保存=保存，两者都开=提交
     q('#f-finish').value = quiz.autoSubmit ? 'submit' : (quiz.autoSave ? 'save' : 'manual');
     q('#f-cache').checked = !!quiz.useCache;

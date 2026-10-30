@@ -96,7 +96,7 @@ function setup(withSubmit, opts) {
   const code = MODULES.map((f) => fs.readFileSync(path.join(SRC, f), 'utf8')).join('\n');
   const prefix = `var UI = { setStatus: function(){}, mount: function(){}, openSettings: function(){} };\nvar unsafeWindow = undefined;\n`;
   // eslint-disable-next-line no-new-func
-  const api = new Function(`${prefix}${code}\nreturn { Config, Runner, auditAnswerState, formatRanges, readAnswerValue, verifyChoiceValue, isOptionChecked };`)();
+  const api = new Function(`${prefix}${code}\nreturn { Config, Runner, auditAnswerState, formatRanges, readAnswerValue, verifyChoiceValue, isOptionChecked, makeGuess: Runner.makeGuess };`)();
 
   const cfg = api.Config.load();
   cfg.profiles.default.apiKey = 'sk-test';
@@ -324,6 +324,26 @@ function setup(withSubmit, opts) {
     let threw = false;
     try { api.Runner.skipWait(); } catch (e) { threw = true; }
     ok(!threw, '不在等待中时调用 skipWait 安全');
+  }
+
+  /* ---------- 场景 7.5：猜题兜底 ---------- */
+  console.log('\n[猜题兜底]');
+  {
+    const { api } = setup(true, {});
+    const opt = (k, t) => ({ key: k, text: t || k });
+    const single = { type: 'single', options: [opt('A'), opt('B'), opt('C'), opt('D')] };
+    ok(api.makeGuess(single).length === 1 && api.makeGuess(single)[0].key === 'B', '★ 单选猜 B（原脚本同款）');
+
+    const multi = { type: 'multi', options: [opt('A'), opt('B'), opt('C'), opt('D')] };
+    ok(api.makeGuess(multi).length === 4, '★ 多选猜全选');
+
+    const judge = { type: 'judge', options: [opt('A', '正确'), opt('B', '错误')] };
+    ok(api.makeGuess(judge)[0].text === '错误', '★ 判断猜「错」');
+
+    const noB = { type: 'single', options: [opt('甲'), opt('乙')] };
+    ok(api.makeGuess(noB).length === 1, '没有 B 选项时退到第二个');
+
+    ok(api.makeGuess(null) === null, '空输入安全');
   }
 
   console.log(`\n${'─'.repeat(44)}`);

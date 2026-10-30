@@ -704,14 +704,26 @@ const Runner = {
         }
 
         if (!r.match) {
-          this.stats.skipped++;
-          log('第 ' + (i + 1) + ' 题没有匹配上选项，跳过（' + truncateText(q.stem) + '）', 'warn');
-          continue;
+          // 猜题兜底（学原脚本的 randomDo）：模型没答案时按题型猜一个默认值。
+          // 空着提交 = 那题 0 分；猜一个 = 至少有概率得分，而且覆盖率能到提交门槛。
+          // 日志里明确标注"猜的"，用户可以回头改。
+          if (cfg.guessOnMiss) {
+            const guess = this.makeGuess(q);
+            if (guess) {
+              r.match = { options: guess };
+              log('第 ' + (i + 1) + ' 题没有匹配到答案，按默认猜测（可在页面上改）', 'warn');
+            }
+          }
+          if (!r.match) {
+            this.stats.skipped++;
+            log('第 ' + (i + 1) + ' 题没有匹配上选项，跳过（' + truncateText(q.stem) + '）', 'warn');
+            continue;
+          }
         }
         if (r.ans.confidence < cfg.minConfidence) {
-          this.stats.skipped++;
-          log('第 ' + (i + 1) + ' 题把握不足（置信度 ' + r.ans.confidence.toFixed(2) + '），跳过', 'warn');
-          continue;
+          // 照原脚本精神：从不空着。模型没把握也比空着强——空着必错，
+          // 填了还有概率对，而且覆盖率能到提交门槛。日志标明让用户可复核。
+          log('第 ' + (i + 1) + ' 题把握不足（置信度 ' + r.ans.confidence.toFixed(2) + '），仍填入答案，可在页面上改', 'warn');
         }
 
         // 单选题/判断题只点一个；多选题要把该点的点上、不该点的点掉
@@ -863,6 +875,20 @@ const Runner = {
       };
       tick();
     });
+  },
+
+  /** 猜题兜底：模型没答案时按题型给一个默认答案（学原脚本的 randomDo）。
+   *  单选选 B、多选全选、判断选"错"——和原脚本同款。
+   *  @returns {Array<Element>|null} 选中的选项元素 */
+  makeGuess(q) {
+    if (!q || !q.options || !q.options.length) return null;
+    if (q.type === 'multi') return q.options.slice();                       // 多选：全选
+    if (q.type === 'judge') {
+      const wrong = q.options.find((o) => /错|否|×|✗|false/i.test(o.text || ''));
+      return wrong ? [wrong] : null;                                        // 判断：选"错"
+    }
+    const b = q.options.find((o) => o.key === 'B');
+    return b ? [b] : (q.options[1] || q.options[0] ? [q.options[1] || q.options[0]] : null);  // 单选：B
   },
 
   async finish(cfg) {
