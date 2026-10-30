@@ -218,6 +218,48 @@ const CoursePilot = {
     return null;
   },
 
+  /**
+   * 点顶部步骤页签（「2视频」/「视频」）把当前步骤切到视频。
+   * cards 页面进入小节后常先停在「学习目标」步骤，播放器不渲染——
+   * 不切步骤就永远等不到 video 元素（chaolucky 项目验证过的路径）。
+   * @returns {Element|null} 点完页签后出现的播放器
+   */
+  async probeVideoByTab(doc) {
+    const walk = async (w, depth) => {
+      if (depth > 4) return null;
+      let d = null;
+      try { d = w.document; } catch (e) { return null; }
+      if (!d) return null;
+      for (const t of ['2视频', '视频']) {
+        let el = null;
+        try {
+          el = Array.from(d.querySelectorAll('a, div, span, li')).find((e2) => {
+            if (!e2.getClientRects || e2.getClientRects().length === 0) return false;
+            const tx = (e2.textContent || '').replace(/\s+/g, '');
+            return tx === t;
+          });
+        } catch (e2) { el = null; }
+        if (el) {
+          try { el.click(); } catch (e2) { continue; }
+          await sleep(2000);
+          const v = this.findVideo();
+          if (v) return v;
+        }
+      }
+      let frames = [];
+      try { frames = Array.from(d.querySelectorAll('iframe')); } catch (e2) { return null; }
+      for (const f of frames) {
+        let w2 = null;
+        try { w2 = f.contentWindow; } catch (e2) { continue; }
+        if (!w2) continue;
+        const r = await walk(w2, depth + 1);
+        if (r) return r;
+      }
+      return null;
+    };
+    return walk((doc && doc.defaultView) || window, 0);
+  },
+
   /** 等作业页面出现 */
   async waitHomework(seconds) {
     const deadline = Date.now() + seconds * 1000;
@@ -334,24 +376,10 @@ const CoursePilot = {
   findNextControl(doc) {
     const d = doc || document;
 
-    // 1) 新版学习页底部的"下一节"按钮
-    const sels = [
-      '.jb_btn.jb_btn_92.fs14.prev_next.next',
-      '.prev_next.next',
-      'a.next',
-      '.orientationright',
-    ];
-    for (const s of sels) {
-      let el = null;
-      try { el = d.querySelector(s); } catch (e) { el = null; }
-      if (el && isVisible(el)) return { el: el, kind: 'button' };
-    }
-
-    // 2) 文字是"下一节/下一章/下一个"的按钮
-    const byText = findButtonByText(['下一节', '下一章', '下一个', '下一课'], d);
-    if (byText) return { el: byText, kind: 'text' };
-
-    // 3) 目录树：找当前高亮的节点，点它后面第一个可点的
+    // 1) 目录树优先：找当前高亮节点，点它后面第一个可点的。
+    //    ⚠️ 不能先点底部的「下一节」按钮——在 cards 页面里那是**步骤推进**
+    //    （学习目标→视频→测验），不是切节。步骤走完它还停在同一节里，
+    //    mArg 不变、任务被重复处理（chaolucky 项目也因为这个只走目录树）。
     const act = d.querySelector('.posCatalog_active');
     if (act) {
       let nodes = [];
@@ -375,16 +403,37 @@ const CoursePilot = {
       }
     }
 
-    // 4) 老版目录：h4/h5 上带 cur 前缀的 id
+    // 2) 章节测验步骤的「跳过本步骤」按钮（chaolucky 项目同款）
+    let skipQuiz = null;
+    try { skipQuiz = d.querySelector('#prevNextFocusNext'); } catch (e) { skipQuiz = null; }
+    if (skipQuiz && isVisible(skipQuiz)) return { el: skipQuiz, kind: 'skip-quiz' };
+
+    // 3) 底部「下一节」按钮兜底
+    const sels = [
+      '.jb_btn.jb_btn_92.fs14.prev_next.next',
+      '.prev_next.next',
+      'a.next',
+      '.orientationright',
+    ];
+    for (const s of sels) {
+      let el = null;
+      try { el = d.querySelector(s); } catch (e) { el = null; }
+      if (el && isVisible(el)) return { el: el, kind: 'button' };
+    }
+
+    // 4) 文字是「下一节/下一章/下一个」的按钮
+    const byText = findButtonByText(['下一节', '下一章', '下一个', '下一课'], d);
+    if (byText) return { el: byText, kind: 'text' };
+
+    // 5) 老版目录：h4/h5 上带 cur 前缀的 id
     const heads = Array.from(d.querySelectorAll('h4[id^="cur"], h5[id^="cur"]'));
     if (heads.length) {
-      // 当前节点通常带 active/currents 样式
       let curIdx = heads.findIndex((h) => /active|current/i.test(h.className));
       if (curIdx < 0) curIdx = 0;
       if (curIdx + 1 < heads.length) return { el: heads[curIdx + 1], kind: 'catalog-old' };
     }
 
-    // 5) 老版 tabtags 里的下一个
+    // 6) 老版 tabtags 里的下一个
     const spans = Array.from(d.querySelectorAll('.tabtags span'));
     const curSpan = spans.findIndex((s) => /currents/.test(s.className));
     if (curSpan >= 0 && curSpan + 1 < spans.length) return { el: spans[curSpan + 1], kind: 'tabtags' };
@@ -481,12 +530,14 @@ const CoursePilot = {
       log('播放视频：' + name, 'info');
       UI.setStatus('running', '视频：' + name);
 
-      // 三层递进找播放器：
+      // 四层递进找播放器：
       // 1) 页面上已经渲染出来的 video（有的课程卡片直接内嵌）
       let v = this.findVideo();
-      // 2) 点任务点图标把卡片展开（图标 class 各版本不一，多试几个选择器）
+      // 2) 点顶部步骤页签「2视频」——进节常先停在「学习目标」，不切步骤播放器不渲染
+      if (!v) v = await this.probeVideoByTab(doc);
+      // 3) 点任务点图标把卡片展开（图标 class 各版本不一，多试几个选择器）
       if (!v) v = await this.probeVideoByIcon(doc);
-      // 3) 还没有就等用户手动点开（60 秒）
+      // 4) 还没有就等用户手动点开（60 秒）
       if (!v) {
         log('播放器没渲染出来。如果你看得到视频卡片，手动点开它，脚本会接手', 'warn');
         v = await this.waitVideoElement(60);
