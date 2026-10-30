@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.6.5
+// @version      1.6.6
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.6.5';
+const VERSION = '1.6.6';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -3399,7 +3399,7 @@ const DEFAULT_CONFIG = {
     maxTokens: 300,          // 答案 JSON 很短，给多了反而容易让模型自由发挥
     minConfidence: 0.5,      // 低于此置信度视为"没把握"，不填入答案
     minAnswerRate: 90,       // 作答覆盖率下限（百分比），达到才允许提交。90：个别点击失效的题不至于卡住整卷——空着不交损失更大
-    guessOnMiss: true,       // 没匹配到答案时按题型猜默认值（单选 B / 多选全选 / 判断错），凑满覆盖率
+    guessOnMiss: false,      // 没匹配到答案时按题型猜默认值（单选 B / 多选全选 / 判断错）。默认关：不会的不做，空着保存，继续下一节
     visionModel: '',         // 视觉模型：解码表没收录的字形渲染成图发给它认字（如 glm-4.6v-flash）。留空关闭
     autoSubmit: true,        // 达到覆盖率下限后自动提交
     autoSave: true,          // 未达下限时自动保存，保留已填答案

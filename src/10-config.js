@@ -117,7 +117,7 @@ const DEFAULT_CONFIG = {
     maxTokens: 300,          // 答案 JSON 很短，给多了反而容易让模型自由发挥
     minConfidence: 0.5,      // 低于此置信度视为"没把握"，不填入答案
     minAnswerRate: 90,       // 作答覆盖率下限（百分比），达到才允许提交。90：个别点击失效的题不至于卡住整卷——空着不交损失更大
-    guessOnMiss: true,       // 没匹配到答案时按题型猜默认值（单选 B / 多选全选 / 判断错），凑满覆盖率
+    guessOnMiss: false,      // 没匹配到答案时按题型猜默认值（单选 B / 多选全选 / 判断错）。默认关：不会的不做，空着保存，继续下一节
     visionModel: '',         // 视觉模型：解码表没收录的字形渲染成图发给它认字（如 glm-4.6v-flash）。留空关闭
     autoSubmit: true,        // 达到覆盖率下限后自动提交
     autoSave: true,          // 未达下限时自动保存，保留已填答案
