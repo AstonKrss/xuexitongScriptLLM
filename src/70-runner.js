@@ -134,12 +134,21 @@ function decideAfterSave(saved, cfg, rate, unsupported) {
   const why = (unsupported && unsupported.length)
     ? '有不支持题型已保存（原脚本行为：继续）'
     : '覆盖率不足已保存（原脚本行为：继续）';
-  // 保存成功且配置允许自动保存 → 原脚本行为：完成，继续
-  if (saved && cfg.autoSave) return { status: 'done', reason: why, rate: rate, saved: true, submitted: false };
-  // 答案没落库 → 继续走会丢答案，必须停
+  // autoSave 开着 → 一律继续。哪怕这次保存请求失败也先重试、重试仍失败
+  // 就带着"未落库"的事实继续（调用方会打警告并记下空题号，用户可回来补）。
+  // 原脚本在类似失败场景也是标记完成继续，从不卡住整条刷课流程。
+  if (cfg.autoSave) {
+    return {
+      status: 'done',
+      reason: saved ? why : '保存失败，按设置继续（答案未落库，可回本节手动补）',
+      rate: rate, saved: saved, submitted: false,
+    };
+  }
+  // 关了自动保存 → 用户明确不要代存，这时候继续等于悄悄丢掉全部答案，
+  // 停下把决定权交回用户
   const reason = (unsupported && unsupported.length)
-    ? '有脚本不支持的题型：' + unsupported.join('、')
-    : '覆盖率 ' + rate.toFixed(1) + '% 未达 ' + cfg.minAnswerRate + '%' + (saved ? '' : '，且保存失败');
+    ? '有脚本不支持的题型：' + unsupported.join('、') + '（自动保存已关闭）'
+    : '覆盖率 ' + rate.toFixed(1) + '% 未达 ' + cfg.minAnswerRate + '%（自动保存已关闭）';
   return { status: 'incomplete', reason: reason, rate: rate, saved: saved, submitted: false };
 }
 
@@ -998,12 +1007,19 @@ const Runner = {
     // 这时候提交等于交一张缺题的卷子。宁可留着让你手动补。
     if (this.unsupported.length) {
       log('卷面含脚本写不进的题型：' + this.unsupported.join('、'), 'warn');
-      const saved = await this.trySave(doc, cfg);
+      let saved = await this.trySave(doc, cfg);
+      if (!saved) {
+        // 保存失败先重试一次：页面脚本可能刚好还没挂好，隔两秒再点
+        await sleep(2000);
+        saved = await this.trySave(doc, cfg);
+        if (saved) log('第二次尝试保存成功', 'info');
+      }
       const outcome = decideAfterSave(saved, cfg, rate, this.unsupported);
       if (outcome.status === 'done') {
         // 原脚本同款：对填空/简答这类它处理不了的题，不答、保存、继续下一章。
         // 这类题的答案留在页面上，想补随时回来补。
         log('已保存。按原脚本行为：保存即视为本节作业完成，继续刷课', 'info');
+        this.reportUnfilled();
         UI.setStatus('done', '已保存（' + this.unsupported.join('、') + '待手动补），继续');
         updateWorkBar('💾 已保存，继续下一节');
       } else {
@@ -1162,7 +1178,13 @@ const Runner = {
     }
 
     log('覆盖率 ' + rate.toFixed(1) + '% 未达 ' + cfg.minAnswerRate + '% 的提交门槛，先保存', 'warn');
-    const saved = await this.trySave(doc, cfg);
+    let saved = await this.trySave(doc, cfg);
+    if (!saved) {
+      // 保存失败先重试一次：页面脚本可能刚好还没挂好，隔两秒再点
+      await sleep(2000);
+      saved = await this.trySave(doc, cfg);
+      if (saved) log('第二次尝试保存成功', 'info');
+    }
     const outcome = decideAfterSave(saved, cfg, rate, null);
     if (outcome.status === 'done') {
       // 原脚本同款行为：autoSave 开着时，保存成功就把这份作业标记为完成，
@@ -1170,7 +1192,7 @@ const Runner = {
       // 没填满的题（通常是填空/简答这类脚本写不进的题型）答案还留在页面上，
       // 随时可以回来手动补。之前这里按"未完成"处理，导致保存后停在原地。
       log('已保存。按原脚本行为：保存即视为本节作业完成，继续刷课', 'info');
-      log('没填上的 ' + (100 - rate).toFixed(1) + '% 多为脚本写不进的题型，可在页面上手动补', 'info');
+      this.reportUnfilled();
       UI.setStatus('done', '已保存（未提交），继续');
       updateWorkBar('💾 已保存，继续下一节');
     } else {
@@ -1178,6 +1200,21 @@ const Runner = {
       updateWorkBar('⚠️ 作业未完成，已暂停');
     }
     this.lastResult = outcome;
+  },
+
+  /**
+   * 报告本卷哪些题没写上（题号 + 提醒回本节补）。保存后继续前调用，
+   * 用户要的"告诉用户哪里没写"就是它——不拦流程，只留记录。
+   */
+  reportUnfilled() {
+    try {
+      const empty = auditAnswerState(this.questions || []);
+      if (empty.length) {
+        log('没写的题号：' + formatRanges(empty) + ' —— 多为填空/简答或模型没出答案的题，回这一节可手动补', 'warn');
+      } else {
+        log('本卷没有空题', 'info');
+      }
+    } catch (e) { log('统计空题失败：' + e.message, 'warn'); }
   },
 
   /**

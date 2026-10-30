@@ -363,15 +363,16 @@ function setup(withSubmit, opts) {
     const r2 = D(true, cfg, 53, ['填空题']);
     ok(r2.status === 'done', '★ 含不支持题型 + 已保存 → done（原脚本从不为此卡流程）');
 
-    // 3) 保存失败 → 答案没落库，必须停
+    // 3) 保存失败 → 重试（调用方负责）后仍失败也继续，但明确标记未落库
     const r3 = D(false, cfg, 88.3, null);
-    ok(r3.status === 'incomplete', '保存失败 → incomplete（继续会丢答案）');
-    ok(/保存失败/.test(r3.reason), '失败原因写明保存没成功');
+    ok(r3.status === 'done', '★ 保存失败但 autoSave 开 → 继续刷课（不卡流程）');
+    ok(r3.saved === false && /未落库/.test(r3.reason), '标记保存未成功，提醒可回本节补');
 
-    // 4) 关掉自动保存 → 不代做决定，停下等用户
+    // 4) 关掉自动保存 → 用户明确不要代存，停下把决定权交回
     const cfgNoSave = { autoSave: false, minAnswerRate: 90 };
     const r4 = D(true, cfgNoSave, 88.3, null);
-    ok(r4.status === 'incomplete', 'autoSave 关闭 → 即使点了保存也不算完成');
+    ok(r4.status === 'incomplete', 'autoSave 关闭 → 停下（继续会悄悄丢全部答案）');
+    ok(/自动保存已关闭/.test(r4.reason), '停下原因写明是自动保存被关闭');
   }
 
   console.log(`\n${'─'.repeat(44)}`);
