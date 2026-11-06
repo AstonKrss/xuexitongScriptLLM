@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.6.6
+// @version      1.6.7
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.6.6';
+const VERSION = '1.6.7';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 // 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
@@ -7823,45 +7823,89 @@ const CoursePilot = {
     return null;
   },
 
-  async nextSection(doc, allDone) {
-    const target = this.findNextControl(doc || document);
-    if (!target) {
-      this._sameNextEl = null;
-      this._sameNextCount = 0;
-      return false;
-    }
+  /**
+   * 当前小节的"身份指纹"：目录高亮节点 id + URL 章节 id + 任务清单里的 knowledgeid。
+   * 点了「下一节」之后拿它做前后对比——任何一项变了都说明真的切节了，
+   * 而不是点了个没绑事件的元素还自以为成功。
+   */
+  sectionSignature(d) {
+    let sig = '';
+    try {
+      const act = d.querySelector('.posCatalog_active');
+      sig += (act && act.id) || '';
+    } catch (e) { /* 忽略 */ }
+    sig += '|' + (queryVar('chapterId') || queryVar('knowledgeid') || '');
+    try {
+      const m = this.findMarg();
+      if (m && m.defaults) sig += '|' + (m.defaults.knowledgeid == null ? '' : m.defaults.knowledgeid);
+    } catch (e) { /* 忽略 */ }
+    return sig;
+  },
 
-    // 点了却没反应的话，下一轮还会找到同一个元素。连点两次没变化就别再点了，
-    // 否则会对着一个死链接空转到 300 轮上限。
-    if (target.el === this._sameNextEl) {
-      this._sameNextCount = (this._sameNextCount || 0) + 1;
-      if (this._sameNextCount >= 2) {
-        log('连续两次点同一个「下一节」页面都没变化，判定它点不动，停止', 'error');
-        this._sameNextEl = null;
-        this._sameNextCount = 0;
-        return false;
-      }
-    } else {
-      this._sameNextEl = target.el;
-      this._sameNextCount = 0;
-    }
+  /** 从 URL 读课程/班级 id。超星参数大小写不统一，全部试一遍 */
+  courseAndClass() {
+    return {
+      courseId: queryVar('courseId') || queryVar('courseid') || '',
+      clazzId: queryVar('clazzId') || queryVar('clazzid') || queryVar('classId') || queryVar('classid') || '',
+    };
+  },
+
+  /**
+   * 给目录节点注入超星自己的跳章函数。
+   * 学习通的点击事件不在 <li class="posCatalog_select"> 上——挂在节点内部的
+   * a/h3，且各版本位置不一。裸点 li 是一次空点，这就是以前"任务做完点了
+   * 下一节却纹丝不动"的直接原因。unrival 的做法是每秒重新 setAttribute 一次
+   * onclick 再点，这里照搬：注入之后 node.click() 一定走得到 getTeacherAjax。
+   * @returns {boolean} 是否注入成功（读不到课程/班级 id 时失败，调用方换姿势）
+   */
+  armCatalogNode(el) {
+    const cid = String((el && el.id) || '').replace(/^cur/, '');
+    const ids = this.courseAndClass();
+    if (!cid || !ids.courseId || !ids.clazzId) return false;
+    try {
+      el.setAttribute('onclick', "getTeacherAjax('" + ids.courseId + "','" + ids.clazzId + "','" + cid + "');");
+      return true;
+    } catch (e) { return false; }
+  },
+
+  /** 直接调用顶层页面全局的 getTeacherAjax 切节，比点击更确定（unrival 同款入口） */
+  directCatalogJump(el) {
+    const cid = String((el && el.id) || '').replace(/^cur/, '');
+    const ids = this.courseAndClass();
+    if (!cid || !ids.courseId || !ids.clazzId) return false;
+    let w = null;
+    try { w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window; } catch (e) { return false; }
+    if (!w || typeof w.getTeacherAjax !== 'function') return false;
+    try {
+      w.getTeacherAjax(ids.courseId, ids.clazzId, cid);
+      log('已直接调用超星 getTeacherAjax 切到下一节', 'info');
+      return true;
+    } catch (e) { return false; }
+  },
+
+  /**
+   * 点「下一节」。返回值：
+   *   true  —— 页面真的切走了（或超星拦停、主动留下处理任务）
+   *   false —— 重试多次仍切不动，主循环应当停止
+   *   null  —— 页面上找不到任何可点的下一节（多半已是最后一节）
+   */
+  async nextSection(doc, allDone) {
+    const d = doc || document;
+    const target = this.findNextControl(d);
+    if (!target) return null;
+
+    // 真正会切节的控件才值得校验重试。skip-quiz / tabtags 是"步骤推进"，
+    // 点了本来就不切节，照旧点一次就走。
+    const realNav = target.kind === 'catalog' || target.kind === 'catalog-old' ||
+      target.kind === 'button' || target.kind === 'text';
+    const isCatalogKind = target.kind === 'catalog' || target.kind === 'catalog-old';
 
     const label = (target.el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
     log('进入下一节：' + (label || target.kind), 'info');
-    try {
-      target.el.click();
-    } catch (e) {
-      log('点击下一节失败：' + e.message, 'error');
-      return false;
-    }
 
-    // 点击后超星会弹两种确认框，都必须处理，否则页面停在弹层上、
-    // 下一轮还在原节里，任务被重复处理、最后误判"下一节点不动"：
-    //  ① 「当前章节还有任务点未完成，是否去完成？」——只有本节任务
-    //     全部处理完（allDone）才确认跳转；否则停下，跳过去就是绕过
-    //  ② 「继续学习/去学习」——直接点掉
-    const d = doc || document;
-    await waitFor(() => {
+    // 弹层处置。「当前章节还有任务点未完成，是否去完成？」——只有本节任务
+    // 全部处理完（allDone）才确认跳转；否则取消，跳过去就是绕过任务点。
+    const handleDialogs = () => {
       let dialog = null;
       try {
         for (const el of d.querySelectorAll('div, section, p')) {
@@ -7877,13 +7921,15 @@ const CoursePilot = {
           log('超星提示还有任务点未完成，已停下（allDone=false，不强行跳）', 'warn');
           const cancel = findButtonByText(['取消', '返回', '否'], d);
           if (cancel) { try { cancel.click(); } catch (e) { /* 忽略 */ } }
-          return true;
+          return 'cancel';
         }
-        const ok = findButtonByText(['下一节'], dialog);
+        let ok = findButtonByText(['下一节', '确定', '去完成', '仍要跳转', '继续'], dialog);
+        // 有的版本按钮和文案不在同一个节点里，兜底全页找
+        if (!ok) ok = findButtonByText(['下一节', '确定', '去完成', '仍要跳转'], d);
         if (ok) {
           try { ok.click(); } catch (e) { /* 忽略 */ }
           log('本节任务已全部处理，确认超星的跳节询问', 'info');
-          return true;
+          return 'confirm';
         }
       }
 
@@ -7891,12 +7937,86 @@ const CoursePilot = {
       if (c) {
         try { c.click(); } catch (e) { /* 忽略 */ }
         log('点掉了「继续学习」弹层', 'info');
-        return true;
+        return 'confirm';
       }
-      return false;
-    }, 5000, 500);
+      return null;
+    };
 
-    return true;
+    if (!realNav) {
+      try { target.el.click(); } catch (e) { log('点击下一节失败：' + e.message, 'error'); return false; }
+      await waitFor(() => handleDialogs() !== null, 5000, 500);
+      return true;
+    }
+
+    // ---------- 真切节的控件：点完必须验证页面真的切走了 ----------
+    // mooc2 切节是局部加载、不整页刷新，不能靠"有没有 reload"判断，
+    // 只能比对小节指纹。指纹没变就换姿势重试——以前是同一个元素点 2 次
+    // 就放弃，结果一节做完永远停在原地；unrival 是每 2 秒点一次直到页面变化。
+    const sigBefore = this.sectionSignature(d);
+    const pw = (() => {
+      try { return (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window; }
+      catch (e) { return window; }
+    })();
+    let savedConfirm = null;
+    if (allDone) {
+      // 有的版本用原生 confirm 拦"任务点未完成"，不接管它会一直挂住没人点。
+      // 只在本节任务都做完的跳转里放行，守住"不绕过任务点"的底线。
+      try { savedConfirm = pw.confirm; pw.confirm = function () { return true; }; } catch (e) { savedConfirm = null; }
+    }
+
+    let cancelledUnfinished = false;
+    let missingParams = false;
+    try {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (this.stopFlag) return false;
+        if (attempt > 0) await sleep(2500);
+
+        const dlg = handleDialogs();
+        if (dlg === 'cancel') { cancelledUnfinished = true; break; }
+
+        if (isCatalogKind) {
+          const armed = this.armCatalogNode(target.el);
+          if (!armed && !missingParams) {
+            missingParams = true;
+            log('读不到 courseId/clazzId，无法注入 getTeacherAjax，改用普通点击', 'warn');
+          }
+          // 隔一轮换一次直接调用，避免和 onclick 注入叠加成重复加载
+          if (attempt === 1 || attempt === 3) this.directCatalogJump(target.el);
+          if (attempt >= 2) {
+            // 节点本身点不动就试内层 h3/a——有些版本事件绑在那里
+            let inner = null;
+            try { inner = target.el.querySelector('h3, a'); } catch (e) { inner = null; }
+            if (inner) {
+              try { inner.click(); } catch (e) { /* 忽略 */ }
+            } else {
+              try { target.el.click(); } catch (e) { /* 忽略 */ }
+            }
+          } else {
+            try { target.el.click(); } catch (e) { /* 忽略 */ }
+          }
+        } else {
+          try { target.el.click(); } catch (e) { /* 忽略 */ }
+        }
+
+        const moved = await waitFor(() => {
+          if (this.stopFlag) return true;
+          if (handleDialogs() === 'cancel') { cancelledUnfinished = true; return true; }
+          return this.sectionSignature(d) !== sigBefore;
+        }, 6000, 800);
+        if (cancelledUnfinished) break;
+        if (moved) return true;
+        log('第 ' + (attempt + 1) + ' 次点击后页面没有切换，换个方式再试', 'warn');
+      }
+    } finally {
+      if (savedConfirm != null) {
+        try { pw.confirm = savedConfirm; } catch (e) { /* 忽略 */ }
+      }
+    }
+
+    if (cancelledUnfinished) return true;   // 主动留下处理任务，不算失败
+    if (this.stopFlag) return false;
+    log('「下一节」重试 5 次页面都没切换，自动刷课停止。手动翻页后重新点「自动刷课」可继续', 'error');
+    return false;
   },
 
   /* ---------- 任务执行（对照原脚本补齐的三块） ---------- */
@@ -8169,7 +8289,8 @@ const CoursePilot = {
         this.stats.sections++;
         await sleep(3000);
         const movedAll = await this.nextSection(this.doc || document, true);
-        if (!movedAll) { log('没有找到下一节，可能已经是最后一节了', 'success'); break; }
+        if (movedAll === null) { log('没有找到下一节，可能已经是最后一节了', 'success'); break; }
+        if (!movedAll) break;   // nextSection 里已说明卡在哪
         await sleep(6000);
         continue;
       }
@@ -8186,7 +8307,8 @@ const CoursePilot = {
         log('本节任务全部完成，进入下一节', 'success');
         await sleep(3000);
         const moved = await this.nextSection(this.doc || document, true);
-        if (!moved) { log('没有找到下一节，可能已经是最后一节了', 'success'); break; }
+        if (moved === null) { log('没有找到下一节，可能已经是最后一节了', 'success'); break; }
+        if (!moved) break;   // nextSection 里已说明卡在哪
         await sleep(6000);
         continue;
       }
@@ -8230,10 +8352,11 @@ const CoursePilot = {
 
       // 3) 点下一节
       const moved = await this.nextSection(this.doc || document);
-      if (!moved) {
+      if (moved === null) {
         log('没有找到下一节，可能已经是最后一节了', 'success');
         break;
       }
+      if (!moved) break;   // nextSection 里已说明卡在哪
       this.stats.sections++;
       // 等新内容加载。超星是整页跳转，这里主要覆盖 SPA 式的局部刷新
       await sleep(6000);
