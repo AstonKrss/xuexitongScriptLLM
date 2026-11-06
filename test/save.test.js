@@ -90,7 +90,18 @@ function setup(withSubmit, opts) {
   const clicks = [];
   ['saveBtn', 'submitBtn'].forEach((id) => {
     const el = w.document.getElementById(id);
-    if (el) el.addEventListener('click', () => clicks.push(id));
+    if (!el) return;
+    el.addEventListener('click', () => {
+      clicks.push(id);
+      if (id === 'submitBtn') {
+        // 真实页面提交成功后会跳到批阅页或题目容器消失；测试页给一个等价信号
+        // （verifySubmitted 认可「提交成功」文字）。此前测试页什么信号都不发，
+        // 全靠"容器不存在=已切换"的误判瞬间通过——那个误判已在 v1.7.0 修掉。
+        const tip = w.document.createElement('div');
+        tip.textContent = '提交成功';
+        w.document.body.appendChild(tip);
+      }
+    });
   });
 
   const code = MODULES.map((f) => fs.readFileSync(path.join(SRC, f), 'utf8')).join('\n');
@@ -104,7 +115,6 @@ function setup(withSubmit, opts) {
   cfg.profiles.default.model = 'deepseek-chat';
   cfg.quiz.fillDelayMin = 1;
   cfg.quiz.fillDelayMax = 2;
-  cfg.quiz.enforceMinDuration = false;
   cfg.quiz.autoSubmit = !!opts.autoSubmit;
   cfg.quiz.autoSave = opts.autoSave !== false;
   api.Config.save();
@@ -315,15 +325,6 @@ function setup(withSubmit, opts) {
       '★ 判断题 val-param=true 的选项判定为已选');
     ok(api.isOptionChecked({ key: 'B', clickEl: liF, input: null }, d) === false,
       '判断题 val-param=false 的选项判定为未选');
-  }
-
-  /* ---------- 场景 13：跳过等待 ---------- */
-  console.log('\n[跳过等待]');
-  {
-    const { api } = setup(true, {});
-    let threw = false;
-    try { api.Runner.skipWait(); } catch (e) { threw = true; }
-    ok(!threw, '不在等待中时调用 skipWait 安全');
   }
 
   /* ---------- 场景 7.5：猜题兜底 ---------- */

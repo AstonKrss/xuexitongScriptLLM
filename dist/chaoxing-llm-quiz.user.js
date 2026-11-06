@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.6.7
+// @version      1.7.0
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,15 +40,8 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.6.7';
+const VERSION = '1.7.0';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
-
-// 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
-// 用 timeOrigin 而不是脚本初始化那一刻：超星如果要算时长，大概率是从页面进入算起，
-// 而不是从用户点按钮算起。口径偏保守的一侧更安全。
-const PAGE_STARTED_AT = (typeof performance !== 'undefined' && performance.timeOrigin)
-  ? performance.timeOrigin
-  : Date.now();
 
 /* ---------- 脚本管理器能力探测 ---------- */
 // Tampermonkey 新旧两套 API 并存：GM_xmlhttpRequest（回调式）与 GM.xmlHttpRequest（Promise 式）。
@@ -3407,8 +3400,6 @@ const DEFAULT_CONFIG = {
     cacheLimit: 3000,        // 缓存条数上限，超出按最久未用淘汰
     fillDelayMin: 3000,      // D-16 逐题最小间隔（毫秒）
     fillDelayMax: 8000,      // D-16 逐题最大间隔（毫秒）
-    enforceMinDuration: false, // D-17 是否启用最短作答时长控制。默认关闭：等 25 分钟的体验太差，且自动刷课模式下用户明确要求直接跳。想开就在设置里勾上
-    minSecondsPerQuestion: 25, // D-17 每题折合的最短秒数，总时长下限 = 题数 × 该值
     decodeFont: true,        // D-31 是否解码 .font-cxsecret 字体加密（见 45-font.js）
   },
 
@@ -6238,7 +6229,7 @@ function setOptionState(opt, wanted, box) {
  * 一旦点了，轻则提交被服务端拒回，重则页面被重置、填好的答案全丢
  * （实测出现过：60 题填满，点提交后答案全消失）。
  */
-const UNSAFE_CONFIRM = /未完成|没有完成|尚未完成|未作答|还有\s*\d+\s*(道|题)|确定要提交/;
+const UNSAFE_CONFIRM = /未完成|没有完成|尚未完成|未作答|还有\s*\d+\s*(道|题)/;
 
 /**
  * 在目标 window 上临时装一个 confirm 守卫，然后执行 fn。
@@ -6408,14 +6399,6 @@ function auditAnswerState(questions) {
   return empty;
 }
 
-// 计算还差多少毫秒才满足最短作答时长。抽成纯函数是为了能单测，
-// 否则这段逻辑只能靠真等 8 分钟来验证。
-function computeMinDurationWait(totalQuestions, secondsPerQuestion, startedAt, now) {
-  const requiredMs = totalQuestions * secondsPerQuestion * 1000;
-  const elapsedMs = now - startedAt;
-  return { requiredMs: requiredMs, elapsedMs: elapsedMs, remainMs: Math.max(0, requiredMs - elapsedMs) };
-}
-
 /* ---------- 填空题填入 ----------
  * React 受控组件的 value 不能直接赋值——直接改 input.value 它收不到，
  * 必须走原型上的 setter 再手动派发 input/change 事件。
@@ -6517,7 +6500,6 @@ const Runner = {
   async start() {
     if (this.running) { log('已经在跑了，别重复点', 'warn'); return; }
     this.lastResult = null;
-    this._pilotSkipWait = false;
     const cfg = Config.quiz;
     const profile = Config.active();
 
@@ -6606,6 +6588,17 @@ const Runner = {
       // 分页作业只处理当前页。与其默默漏掉后面的题，不如明确告诉用户要逐页跑。
       if (findButtonByText(['下一题', '下一页', '下一部分'], doc)) {
         log('检测到「下一题」按钮，这份作业可能是分页的。本脚本只处理当前页，做完请翻页再点一次', 'warn');
+        if (typeof CoursePilot !== 'undefined' && CoursePilot.running) {
+          // 自动刷课没人翻页：带着后面几页空白交上去，比停下来更糟
+          log('自动刷课遇到分页卷子，已暂停——后面的页需要手动翻页补答，跳过去就是交白卷', 'error');
+          UI.setStatus('warn', '分页卷子，已暂停');
+          updateWorkBar('⚠️ 分页卷子，已暂停');
+          this.lastResult = {
+            status: 'incomplete', reason: '分页卷子只处理当前页，其余页需手动补答',
+            rate: 0, saved: false, submitted: false,
+          };
+          return;
+        }
       }
 
       const profileConf = Object.assign({}, cfg);
@@ -6788,86 +6781,19 @@ const Runner = {
         await sleep(randInt(cfg.fillDelayMin, cfg.fillDelayMax));
       }
 
-      // 提交/保存之前先满足最短作答时长，避免"进入页面几十秒就交卷"这种最明显的机器特征
-      await this.enforceMinDuration(cfg);
-
-      AnswerCache.flush();
       await this.finish(cfg);
     } catch (e) {
       log('运行中断：' + e.message, 'error');
       UI.setStatus('error', '运行中断');
+      // 给 CoursePilot 一个明确的失败结果——不写的话它读到 null，日志只会说
+      // "没有拿到运行结果"，排查时不知道断在哪一步
+      this.lastResult = { status: 'error', reason: e.message, rate: 0, saved: false, submitted: false };
     } finally {
+      // 放进 finally：中途抛异常（配额报错、解析出错）时，本轮已经花 token
+      // 换来的答案也要落库，重跑同一份卷子就不用再请求一遍
+      try { AnswerCache.flush(); } catch (e2) { /* 落库失败不影响收尾 */ }
       this.running = false;
     }
-  },
-
-  /**
-   * 把作答总时长补到下限。
-   *
-   * 为什么要有这一步：脚本填 20 道选择题只要几十秒，真人要 6~12 分钟。
-   * "进入作业页到提交"的间隔是最容易计算、误判率最低的机器特征，
-   * 假设超星要查行为，这是首选指标。这里用最笨也最有效的办法消掉它：等。
-   *
-   * 计时起点是页面加载时刻而非点按钮时刻，因为用户可能早就打开页面看了一会儿，
-   * 那段时间超星一样算在内。
-   */
-  async enforceMinDuration(cfg) {
-    // 自动刷课路径下不做等待：60 题 × 25 秒 = 25 分钟干等，用户明确要求直接跳。
-    // 手动点「开始答题」时按配置来（设置里可开）。
-    if (this._pilotSkipWait) {
-      log('自动刷课模式：跳过最短作答时长等待', 'info');
-      return;
-    }
-    if (!cfg.enforceMinDuration || !cfg.minSecondsPerQuestion) return;
-
-    const plan = computeMinDurationWait(this.stats.total, cfg.minSecondsPerQuestion, PAGE_STARTED_AT, Date.now());
-    const remainMs = plan.remainMs;
-
-    if (remainMs <= 0) {
-      log('作答时长 ' + formatDuration(plan.elapsedMs) + '，已满足 ' + this.stats.total +
-        ' 题 × ' + cfg.minSecondsPerQuestion + ' 秒的要求', 'info');
-      return;
-    }
-
-    log('为避免作答时长过短，还需等待 ' + formatDuration(remainMs) +
-      '（要求 ' + this.stats.total + ' 题 × ' + cfg.minSecondsPerQuestion + ' 秒 = ' +
-      formatDuration(plan.requiredMs) + '）', 'warn');
-    UI.setStatus('running', '等待时长补足 ' + formatDuration(remainMs));
-
-    // 分片等待，每 60 秒报一次进度，同时保持对"停止"和"跳过等待"的响应
-    const deadline = Date.now() + remainMs;
-    let nextReport = remainMs - 60000;
-    this.waiting = true;
-    this.skipWaitFlag = false;
-    try {
-      while (Date.now() < deadline) {
-        if (this.stopFlag) { log('已停止等待，不会提交', 'warn'); return; }
-        if (this.skipWaitFlag) {
-          log('已跳过剩余等待，直接进入提交/保存环节', 'warn');
-          return;
-        }
-        const left = deadline - Date.now();
-        if (left <= 0) break;
-        if (left <= nextReport) {
-          log('剩余等待 ' + formatDuration(left) + '（不想等就点「跳过等待」）', 'info');
-          nextReport -= 60000;
-        }
-        await sleep(Math.min(5000, left));
-      }
-    } finally {
-      this.waiting = false;
-      this.skipWaitFlag = false;
-    }
-    log('作答时长已补足，继续', 'success');
-  },
-
-  /** 跳过剩余的最短作答时长等待。只在等待阶段有效，不改变"要不要提交" */
-  skipWait() {
-    if (!this.waiting) {
-      log('当前不在等待中，无需跳过', 'info');
-      return;
-    }
-    this.skipWaitFlag = true;
   },
 
   /**
@@ -6876,7 +6802,7 @@ const Runner = {
    * 之前"调了提交函数就算 done"，自动刷课拿着假 done 去跳节，
    * 作业实际没交，下一节还是同一份卷子。
    */
-  verifySubmitted(doc, seconds) {
+  verifySubmitted(doc, seconds, hadContainers) {
     const d = doc || this.doc || document;
     const t0 = Date.now();
     return new Promise((resolve) => {
@@ -6887,7 +6813,10 @@ const Runner = {
           if (/selectWorkQuestionYiPiYue|workReView|reVersionPaperMark|work\/view/.test(href)) return resolve(true);
         } catch (e) { /* 忽略 */ }
         try {
-          if (!d.querySelectorAll('.Py-mian1, .TiMu').length) return resolve(true);   // 题目容器没了 = 页面已切换
+          // "容器没了 = 页面已切换"只有在**原来就有容器**时才成立。新版 React 页面
+          // （靠 radio/checkbox 数量识别）从头就没有这两个容器，不做快照对比的话，
+          // 点提交后第一次检查就会假阳性"提交成功"。
+          if (hadContainers !== false && !d.querySelectorAll('.Py-mian1, .TiMu').length) return resolve(true);   // 题目容器没了 = 页面已切换
           if (/提交成功/.test(d.body ? d.body.textContent : '')) return resolve(true);
         } catch (e) { /* 忽略 */ }
         if (Date.now() - t0 > (seconds || 15) * 1000) return resolve(false);
@@ -6990,23 +6919,18 @@ const Runner = {
           return;
         }
 
-        const btn = findButtonByText(SUBMIT_TEXTS, doc);
-        if (!btn) {
-          log('找不到提交按钮，先帮你把答案存下来。如果页面上确实有提交按钮，把它的文字告诉我', 'error');
-          const saved = await this.trySave(doc, cfg);
-          UI.setStatus('warn', saved ? '已保存（未提交）' : '找不到提交按钮');
-          this.lastResult = {
-            status: saved ? 'done' : 'filled',
-            reason: saved ? '只保存了，没找到提交按钮' : '找不到提交按钮',
-            rate: rate, saved: saved, submitted: false,
-          };
-          return;
-        }
         UI.setStatus('running', '正在提交…');
         const guard = (m) => !UNSAFE_CONFIRM.test(m);
+        // 提交前先快照：这份文档本来有没有题目容器。下面"容器消失=已切换"的
+        // 成功信号只对本来就有容器的文档成立——新版 React 页面靠 radio/checkbox
+        // 数量识别，从头就没有 .TiMu/.Py-mian1，不做对比会在第一次检查就假阳性。
+        const hadQuizContainers = (() => {
+          try { return !!doc.querySelector('.Py-mian1, .TiMu'); } catch (e) { return true; }
+        })();
 
-        // 优先调页面自带的提交函数：不经过按钮，也不会被"未完成"确认框卡住，
-        // 该拦的由 guard 拦。原脚本走的就是 submitCheckTimes()。
+        // 优先调页面自带的提交函数：不经过按钮，不怕按钮文案变，
+        // 也不会被"未完成"确认框卡住，该拦的由 guard 拦。原脚本走的就是 submitCheckTimes()。
+        // 之前它被排在"必须先找到提交按钮"后面，按钮文案一变这条最稳的路就死了。
         const pageFn = findPageFn(doc, SUBMIT_FNS);
         if (pageFn) {
           const lr = await callWithGuard(pageFn.win, guard, () => pageFn.fn.call(pageFn.win));
@@ -7028,7 +6952,7 @@ const Runner = {
             // done 去跳节，作业实际没交，下一节还是同一份卷子。
             // 验证信号照原脚本：提交成功后页面会跳到已批阅页，或题目容器消失。
             log('已调用页面自带的 ' + pageFn.name + '() 提交，等待提交结果…', 'info');
-            const okSubmit = await this.verifySubmitted(doc);
+            const okSubmit = await this.verifySubmitted(doc, 15, hadQuizContainers);
             if (okSubmit) {
               log('提交成功（页面已跳到批阅页/题目已清空）', 'success');
               UI.setStatus('done', '已提交');
@@ -7050,6 +6974,19 @@ const Runner = {
           log('调用 ' + pageFn.name + '() 出错：' + lr.error.message + '，改用点按钮', 'warn');
         }
 
+        // 页面函数不存在或调用失败时，才退回点提交按钮
+        const btn = findButtonByText(SUBMIT_TEXTS, doc);
+        if (!btn) {
+          log('找不到提交按钮，也没找到页面自带的提交函数（试过 ' + SUBMIT_FNS.join('/') + '）。先帮你把答案存下来；如果页面上确实有提交按钮，把它的文字告诉我', 'error');
+          const saved = await this.trySave(doc, cfg);
+          UI.setStatus('warn', saved ? '已保存（未提交）' : '找不到提交按钮');
+          this.lastResult = {
+            status: saved ? 'done' : 'filled',
+            reason: saved ? '只保存了，没找到提交按钮' : '找不到提交按钮',
+            rate: rate, saved: saved, submitted: false,
+          };
+          return;
+        }
         // 兜底：点提交按钮
         const r = await clickWithConfirm(btn, { guard: guard });
         if (r.blocked) {
@@ -7065,7 +7002,7 @@ const Runner = {
           return;
         }
         log('已点击提交，等待提交结果…', 'info');
-        const okSubmitBtn = await this.verifySubmitted(doc);
+        const okSubmitBtn = await this.verifySubmitted(doc, 15, hadQuizContainers);
         if (okSubmitBtn) {
           log('提交成功（页面已跳到批阅页/题目已清空）', 'success');
           UI.setStatus('done', '已提交');
@@ -7165,10 +7102,8 @@ const Runner = {
       log('按当前设置脚本不自动保存，答案只在页面上，别刷新页面', 'warn');
       return false;
     }
-    if (!this.stats || !this.stats.answered) {
-      log('没有填入任何答案，无需保存', 'info');
-      return false;
-    }
+    // 不看 stats.answered 就拒绝保存——模型全程没填上时，页面上可能还有
+    // 用户手填的答案，拒存会连它们一起丢（自动刷课随后会关掉作业窗口）。
 
     // 1) 优先调页面自带的保存函数——原脚本用的就是这条路（noSubmit），
     //    比点按钮可靠：不怕按钮文案变，也不经过确认框那一层。
@@ -7189,7 +7124,11 @@ const Runner = {
       log('把「导出诊断」的结果发我，我按你的页面补上', 'warn');
       return false;
     }
-    await clickWithConfirm(btn);
+    const r = await clickWithConfirm(btn);
+    if (r && r.blocked) {
+      log('保存被超星拦下：' + r.msg + '。答案未必落库，请回页面确认', 'warn');
+      return false;
+    }
     log('已点击「' + (btn.textContent || '').trim() + '」，答案已保存到服务器', 'success');
     return true;
   },
@@ -7367,15 +7306,6 @@ function truncateText(s, n) {
   return t.length > max ? t.slice(0, max) + '…' : t;
 }
 
-// 把毫秒转成"X 分 Y 秒"，用于日志里展示等待时长
-function formatDuration(ms) {
-  const total = Math.max(0, Math.round(ms / 1000));
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  if (m <= 0) return s + ' 秒';
-  return m + ' 分' + (s ? ' ' + s + ' 秒' : '');
-}
-
 
 /* ============================================================
  * 75-course.js
@@ -7497,11 +7427,13 @@ const CoursePilot = {
 
   /**
    * 把 mArg 的 attachments 拆成待办任务。已完成（isPassed）和非任务点不收。
-   * @returns {{videos:Array, documents:Array, works:Array, defaults:Object, totalJobs:number}}
+   * 未知类型（job=true 但不是 video/document/workid）收进 unknown——
+   * 它们不算"已完成"，否则会被"本节任务点已全部完成"分支直接跳走。
+   * @returns {{videos:Array, documents:Array, works:Array, unknown:Array, defaults:Object, totalJobs:number}}
    */
   parseTasks(pageData) {
     const out = {
-      videos: [], documents: [], works: [],
+      videos: [], documents: [], works: [], unknown: [],
       defaults: (pageData && pageData.defaults) || {},
       totalJobs: 0,
     };
@@ -7515,6 +7447,7 @@ const CoursePilot = {
         case 'video': out.videos.push(item); break;
         case 'document': out.documents.push(item); break;
         case 'workid': out.works.push(item); break;
+        default: out.unknown.push(item); break;
       }
     }
     return out;
@@ -7824,22 +7757,38 @@ const CoursePilot = {
   },
 
   /**
-   * 当前小节的"身份指纹"：目录高亮节点 id + URL 章节 id + 任务清单里的 knowledgeid。
-   * 点了「下一节」之后拿它做前后对比——任何一项变了都说明真的切节了，
-   * 而不是点了个没绑事件的元素还自以为成功。
+   * 当前小节的"身份指纹"，三个分量：
+   *   active —— 目录高亮节点的 id
+   *   url    —— URL 上的章节 id
+   *   marg   —— 任务清单里的 knowledgeid（读不到时为 null）
+   * 返回对象而不是拼串：切节与否要按分量判断，iframe 瞬时加载中导致某个
+   * 分量"从有变无"不能当成切节的证据。
    */
   sectionSignature(d) {
-    let sig = '';
+    let active = '';
     try {
       const act = d.querySelector('.posCatalog_active');
-      sig += (act && act.id) || '';
+      active = (act && act.id) || '';
     } catch (e) { /* 忽略 */ }
-    sig += '|' + (queryVar('chapterId') || queryVar('knowledgeid') || '');
+    let url = '';
+    try { url = queryVar('chapterId') || queryVar('knowledgeid') || ''; } catch (e) { url = ''; }
+    let marg = null;
     try {
       const m = this.findMarg();
-      if (m && m.defaults) sig += '|' + (m.defaults.knowledgeid == null ? '' : m.defaults.knowledgeid);
-    } catch (e) { /* 忽略 */ }
-    return sig;
+      if (m && m.defaults && m.defaults.knowledgeid != null) marg = String(m.defaults.knowledgeid);
+    } catch (e) { marg = null; }
+    return { active: active, url: url, marg: marg };
+  },
+
+  /**
+   * 两个指纹是否构成"真的切节了"。只认"已知值 → 另一个已知值"的变化；
+   * 任何分量从有到无（或从无到有）都可能是 iframe 加载中的瞬时状态，不算数。
+   */
+  signatureMoved(before, after) {
+    if (before.active && after.active && before.active !== after.active) return true;
+    if (before.url && after.url && before.url !== after.url) return true;
+    if (before.marg != null && after.marg != null && before.marg !== after.marg) return true;
+    return false;
   },
 
   /** 从 URL 读课程/班级 id。超星参数大小写不统一，全部试一遍 */
@@ -7933,11 +7882,19 @@ const CoursePilot = {
         }
       }
 
+      // 「继续学习/去学习」只认弹层容器里的按钮。课程页上常有常驻的同名
+      // 入口，不加约束的话重试轮询会每 800ms 误点一次，把当前节重载一遍。
       const c = findButtonByText(['继续学习', '去学习'], d);
       if (c) {
-        try { c.click(); } catch (e) { /* 忽略 */ }
-        log('点掉了「继续学习」弹层', 'info');
-        return 'confirm';
+        let inOverlay = false;
+        try {
+          inOverlay = !!c.closest('[class*="layer"], [class*="dialog"], [class*="modal"], [class*="mask"], [class*="pop"]');
+        } catch (e) { inOverlay = false; }
+        if (inOverlay) {
+          try { c.click(); } catch (e) { /* 忽略 */ }
+          log('点掉了「继续学习」弹层', 'info');
+          return 'confirm';
+        }
       }
       return null;
     };
@@ -8001,7 +7958,7 @@ const CoursePilot = {
         const moved = await waitFor(() => {
           if (this.stopFlag) return true;
           if (handleDialogs() === 'cancel') { cancelledUnfinished = true; return true; }
-          return this.sectionSignature(d) !== sigBefore;
+          return this.signatureMoved(sigBefore, this.sectionSignature(d));
         }, 6000, 800);
         if (cancelledUnfinished) break;
         if (moved) return true;
@@ -8022,11 +7979,58 @@ const CoursePilot = {
   /* ---------- 任务执行（对照原脚本补齐的三块） ---------- */
 
   /**
+   * 数一下页面上已播完（ended）且时长正常的 video 元素个数。
+   * 用于识别"同一节二次进入"：mArg 是静态文本，isPassed 不会更新，
+   * 但页面上躺着一个已播完的播放器——这就是上一轮看过的证据。
+   */
+  countEndedVideos() {
+    let n = 0;
+    const walk = (win, depth) => {
+      if (depth > 3) return;
+      let doc = null;
+      try { doc = win.document; } catch (e) { return; }
+      if (!doc) return;
+      try {
+        const vids = doc.querySelectorAll('video');
+        for (const v of vids) {
+          if (v.ended && v.duration && isFinite(v.duration)) n++;
+        }
+      } catch (e) { /* 忽略 */ }
+      let frames = [];
+      try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (e) { return; }
+      for (const f of frames) {
+        let w = null;
+        try { w = f.contentWindow; } catch (e) { continue; }
+        if (w) walk(w, depth + 1);
+      }
+    };
+    walk(window, 0);
+    return n;
+  },
+
+  /**
    * 按清单执行本节任务。返回 false 表示有任务没做完（主循环会停下，不跳节）。
    */
   async runTaskList(tasks, doc) {
+    // ---- 未知类型的任务点：绝不绕过（项目底线）----
+    if (tasks.unknown && tasks.unknown.length) {
+      const names = tasks.unknown.map((t) => t.type || '?').join('、');
+      log('本节有 ' + tasks.unknown.length + ' 个脚本不认识的任务点（类型：' + names + '），无法确认能否自动完成', 'error');
+      log('为避免绕过任务点，自动刷课暂停。请手动处理这一节，或点「导出页面结构」发给作者补充支持', 'warn');
+      UI.setStatus('warn', '未知任务点，已暂停');
+      this.running = false;
+      return false;
+    }
+
     // ---- 视频 ----
+    // 进本清单时页面上已有的播完视频数。同一节二次进入时（作业失败后重试、
+    // 或切节假成功回到原节），视频早就播完了，但清单里 isPassed 还是 false——
+    // 不认这个账的话，findVideo 会因为 ended 被排除而永远找不到播放器，
+    // 最后"等 60 秒没出现"反复暂停，只有刷新页面能解。
+    const endedAtStart = this.countEndedVideos();
+    let videoIdx = -1;
     for (const item of tasks.videos) {
+      videoIdx++;
       if (this.stopFlag) return false;
       const name = (item.property && item.property.name) || '视频';
       log('播放视频：' + name, 'info');
@@ -8039,7 +8043,12 @@ const CoursePilot = {
       if (!v) v = await this.probeVideoByTab(doc);
       // 3) 点任务点图标把卡片展开（图标 class 各版本不一，多试几个选择器）
       if (!v) v = await this.probeVideoByIcon(doc);
-      // 4) 还没有就等用户手动点开（60 秒）
+      // 4) 进门时就已经播完的视频（清单排在前面）视为上一轮看过，不再等
+      if (!v && videoIdx < endedAtStart) {
+        log('视频「' + name + '」已播过（页面里有播完的播放器，清单状态未更新），跳过', 'info');
+        continue;
+      }
+      // 5) 还没有就等用户手动点开（60 秒）
       if (!v) {
         log('播放器没渲染出来。如果你看得到视频卡片，手动点开它，脚本会接手', 'warn');
         v = await this.waitVideoElement(60);
@@ -8255,7 +8264,7 @@ const CoursePilot = {
       let tasks = this.parseTasks(marg);
       let video = this.findVideo();
       let hw = this.detectHomework();
-      let taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length;
+      let taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length + tasks.unknown.length;
 
       // 刚进新节时，任务 iframe 往往还没加载完——清单和 DOM 都可能暂时是空的。
       // 什么都不检测就点「下一节」会把整节作业跳过去（实测踩过），多等两次再放弃。
@@ -8267,7 +8276,7 @@ const CoursePilot = {
           tasks = this.parseTasks(marg);
           video = video || this.findVideo();
           hw = hw || this.detectHomework();
-          taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length;
+          taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length + tasks.unknown.length;
           if (video || hw || taskCount > 0 || tasks.totalJobs > 0) {
             log('等了 ' + ((retry + 1) * 3.5) + ' 秒才发现任务点（iframe 加载慢）', 'info');
             break;
@@ -8297,7 +8306,8 @@ const CoursePilot = {
 
       if (taskCount > 0) {
         log('本节任务（来自页面清单）：视频 ' + tasks.videos.length + '、文档 ' + tasks.documents.length +
-          '、作业 ' + tasks.works.length, 'info');
+          '、作业 ' + tasks.works.length +
+          (tasks.unknown.length ? '、未知类型 ' + tasks.unknown.length : ''), 'info');
         const ok = await this.runTaskList(tasks, this.doc || document);
         if (this.stopFlag || !this.running) break;
         if (!ok) break;   // runTaskList 内部已说明停在哪一步
@@ -8467,7 +8477,9 @@ const CoursePilot = {
     }
     let cfg = null;
     try { cfg = Config.load(); } catch (e) { cfg = null; }
-    const profile = cfg && cfg.profiles ? cfg.profiles[cfg.activeProfile] || cfg.profiles.default : null;
+    const profile = cfg && cfg.profiles
+      ? cfg.profiles[cfg.activeProfileId] || cfg.profiles.default || null
+      : null;
     if (!profile || !profile.apiKey) {
       log('还没配 API Key，没法自动答题。这一节留给你手动处理', 'warn');
       return false;
@@ -8479,8 +8491,7 @@ const CoursePilot = {
       try { Main.resolveQuizDoc(true); } catch (e) { /* 忽略 */ }
     }
 
-    // 自动刷课路径下不等最短作答时长：60 题 × 25 秒 = 25 分钟干等没有意义
-    if (typeof Runner !== 'undefined') Runner._pilotSkipWait = true;
+    // 自动刷课路径下不等最短作答时长（该功能已按作者要求移除）。
 
     // 用户可能同时点了「开始答题」。这时候 Runner 正在跑，start() 会立刻返回，
     // 让我们读到一份过期的结果，白白判成"没做完"。等它跑完再说。
@@ -8530,7 +8541,12 @@ const CoursePilot = {
     let flag = null;
     try { flag = sessionStorage.getItem('llmq:pilot'); } catch (e) { return; }
     if (flag !== '1') return;
-    if (!this.available(document)) return;
+    if (!this.available(document)) {
+      // 现在不在课程页就别续了。不清标志的话，之后同一标签页随便打开
+      // 哪门课都会在 3 秒后"凭空"自动开刷
+      try { sessionStorage.removeItem('llmq:pilot'); } catch (e) { /* 忽略 */ }
+      return;
+    }
     log('检测到上一页的自动刷课还没结束，3 秒后继续', 'info');
     setTimeout(() => { this.start(); }, 3000);
   },
@@ -8834,19 +8850,6 @@ const UI = {
       <input type="text" id="f-vision" placeholder="例：glm-4.6v-flash">
     </div>
     <div style="margin-top:8px">
-      <label class="chk">
-    </div>
-    </div>
-  </div>
-  <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
-
-  <label class="chk"><input type="checkbox" id="f-duration"> 补足最短作答时长（避免提交过快）</label>
-  <div class="row2">
-    <div>
-      <label>最短作答(秒/题)</label>
-      <input type="number" id="f-minsec" min="0" max="120" step="5">
-    </div>
-    <div>
       <label>逐题间隔(秒)</label>
       <div style="display:flex;gap:6px;align-items:center">
         <input type="number" id="f-dmin" min="0" max="60" step="1">
@@ -8855,7 +8858,7 @@ const UI = {
       </div>
     </div>
   </div>
-  <p class="hint">最短作答时长按"题数 × 秒数"算，20 题 × 25 秒 = 8 分 20 秒。脚本填得比人快得多，这一步是为了让作答时长落在合理区间。嫌久可以把秒数调小、取消这个勾，或者跑完直接点面板上的 <b>跳过等待</b>。</p>
+  <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
 
   <label>填完之后怎么做</label>
   <select id="f-finish">
@@ -8892,6 +8895,18 @@ const UI = {
       const act = btn.getAttribute('data-act');
       // 主按钮：同一个按钮，动作随当前页面类型切换
       if (act === 'main') {
+        // 探测窗口只有十几秒，慢加载的卷子会被永久当成"非答题页"。
+        // 点按钮时再复核一次：真有题就按答题页走，避免误启动整门课的自动刷课。
+        if (this.pageKind !== 'quiz') {
+          try {
+            const qdoc = Main.resolveQuizDoc(true);
+            const r = Parser.parse(qdoc);
+            if (r && r.questions.length) {
+              this.setPageKind('quiz');
+              log('重新探测发现了题目，按答题页处理', 'info');
+            }
+          } catch (e) { /* 复核失败按原判定走 */ }
+        }
         if (this.pageKind === 'quiz') {
           if (typeof CoursePilot !== 'undefined' && CoursePilot.running) {
             log('自动刷课正在运行，它会自己处理作业。要手动答题请先停止刷课', 'warn');
@@ -9018,9 +9033,6 @@ const UI = {
         cfg.bank.enabled = false;
         log('题库接口地址为空，已自动关闭题库优先', 'warn');
       }
-      cfg.quiz.enforceMinDuration = q('#f-duration').checked;
-      cfg.quiz.minSecondsPerQuestion = clampNum(q('#f-minsec').value, 0, 120, 25);
-      // 面板上以秒为单位，存配置时换算成毫秒，避免一个字段两套单位
       cfg.quiz.fillDelayMin = clampNum(q('#f-dmin').value, 0, 60, 3) * 1000;
       cfg.quiz.fillDelayMax = clampNum(q('#f-dmax').value, 0, 60, 8) * 1000;
       if (cfg.quiz.fillDelayMax < cfg.quiz.fillDelayMin) {
@@ -9164,8 +9176,6 @@ const UI = {
     q('#f-bankurl').value = bank.endpoint || BUILTIN_BANK.endpoint;
     q('#f-banktoken').value = bank.token || BUILTIN_BANK.token;
     this.syncBankInputs();
-    q('#f-duration').checked = !!quiz.enforceMinDuration;
-    q('#f-minsec').value = quiz.minSecondsPerQuestion;
     q('#f-dmin').value = Math.round((quiz.fillDelayMin || 0) / 1000);
     q('#f-dmax').value = Math.round((quiz.fillDelayMax || 0) / 1000);
 
@@ -9251,6 +9261,9 @@ const UI = {
     if (typeof CoursePilot === 'undefined') { log('自动刷课模块未加载', 'error'); return; }
     if (CoursePilot.running) {
       CoursePilot.stop();
+      // 刷课停了，正在后台答题的 Runner 也不能继续跑——不然它会把作业
+      // 做完甚至提交，用户明明点了停止
+      if (typeof Runner !== 'undefined' && Runner.running) Runner.stop();
       return;
     }
     if (!CoursePilot.available(document)) {

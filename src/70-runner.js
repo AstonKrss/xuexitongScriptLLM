@@ -300,7 +300,7 @@ function setOptionState(opt, wanted, box) {
  * 一旦点了，轻则提交被服务端拒回，重则页面被重置、填好的答案全丢
  * （实测出现过：60 题填满，点提交后答案全消失）。
  */
-const UNSAFE_CONFIRM = /未完成|没有完成|尚未完成|未作答|还有\s*\d+\s*(道|题)|确定要提交/;
+const UNSAFE_CONFIRM = /未完成|没有完成|尚未完成|未作答|还有\s*\d+\s*(道|题)/;
 
 /**
  * 在目标 window 上临时装一个 confirm 守卫，然后执行 fn。
@@ -470,14 +470,6 @@ function auditAnswerState(questions) {
   return empty;
 }
 
-// 计算还差多少毫秒才满足最短作答时长。抽成纯函数是为了能单测，
-// 否则这段逻辑只能靠真等 8 分钟来验证。
-function computeMinDurationWait(totalQuestions, secondsPerQuestion, startedAt, now) {
-  const requiredMs = totalQuestions * secondsPerQuestion * 1000;
-  const elapsedMs = now - startedAt;
-  return { requiredMs: requiredMs, elapsedMs: elapsedMs, remainMs: Math.max(0, requiredMs - elapsedMs) };
-}
-
 /* ---------- 填空题填入 ----------
  * React 受控组件的 value 不能直接赋值——直接改 input.value 它收不到，
  * 必须走原型上的 setter 再手动派发 input/change 事件。
@@ -579,7 +571,6 @@ const Runner = {
   async start() {
     if (this.running) { log('已经在跑了，别重复点', 'warn'); return; }
     this.lastResult = null;
-    this._pilotSkipWait = false;
     const cfg = Config.quiz;
     const profile = Config.active();
 
@@ -668,6 +659,17 @@ const Runner = {
       // 分页作业只处理当前页。与其默默漏掉后面的题，不如明确告诉用户要逐页跑。
       if (findButtonByText(['下一题', '下一页', '下一部分'], doc)) {
         log('检测到「下一题」按钮，这份作业可能是分页的。本脚本只处理当前页，做完请翻页再点一次', 'warn');
+        if (typeof CoursePilot !== 'undefined' && CoursePilot.running) {
+          // 自动刷课没人翻页：带着后面几页空白交上去，比停下来更糟
+          log('自动刷课遇到分页卷子，已暂停——后面的页需要手动翻页补答，跳过去就是交白卷', 'error');
+          UI.setStatus('warn', '分页卷子，已暂停');
+          updateWorkBar('⚠️ 分页卷子，已暂停');
+          this.lastResult = {
+            status: 'incomplete', reason: '分页卷子只处理当前页，其余页需手动补答',
+            rate: 0, saved: false, submitted: false,
+          };
+          return;
+        }
       }
 
       const profileConf = Object.assign({}, cfg);
@@ -850,86 +852,19 @@ const Runner = {
         await sleep(randInt(cfg.fillDelayMin, cfg.fillDelayMax));
       }
 
-      // 提交/保存之前先满足最短作答时长，避免"进入页面几十秒就交卷"这种最明显的机器特征
-      await this.enforceMinDuration(cfg);
-
-      AnswerCache.flush();
       await this.finish(cfg);
     } catch (e) {
       log('运行中断：' + e.message, 'error');
       UI.setStatus('error', '运行中断');
+      // 给 CoursePilot 一个明确的失败结果——不写的话它读到 null，日志只会说
+      // "没有拿到运行结果"，排查时不知道断在哪一步
+      this.lastResult = { status: 'error', reason: e.message, rate: 0, saved: false, submitted: false };
     } finally {
+      // 放进 finally：中途抛异常（配额报错、解析出错）时，本轮已经花 token
+      // 换来的答案也要落库，重跑同一份卷子就不用再请求一遍
+      try { AnswerCache.flush(); } catch (e2) { /* 落库失败不影响收尾 */ }
       this.running = false;
     }
-  },
-
-  /**
-   * 把作答总时长补到下限。
-   *
-   * 为什么要有这一步：脚本填 20 道选择题只要几十秒，真人要 6~12 分钟。
-   * "进入作业页到提交"的间隔是最容易计算、误判率最低的机器特征，
-   * 假设超星要查行为，这是首选指标。这里用最笨也最有效的办法消掉它：等。
-   *
-   * 计时起点是页面加载时刻而非点按钮时刻，因为用户可能早就打开页面看了一会儿，
-   * 那段时间超星一样算在内。
-   */
-  async enforceMinDuration(cfg) {
-    // 自动刷课路径下不做等待：60 题 × 25 秒 = 25 分钟干等，用户明确要求直接跳。
-    // 手动点「开始答题」时按配置来（设置里可开）。
-    if (this._pilotSkipWait) {
-      log('自动刷课模式：跳过最短作答时长等待', 'info');
-      return;
-    }
-    if (!cfg.enforceMinDuration || !cfg.minSecondsPerQuestion) return;
-
-    const plan = computeMinDurationWait(this.stats.total, cfg.minSecondsPerQuestion, PAGE_STARTED_AT, Date.now());
-    const remainMs = plan.remainMs;
-
-    if (remainMs <= 0) {
-      log('作答时长 ' + formatDuration(plan.elapsedMs) + '，已满足 ' + this.stats.total +
-        ' 题 × ' + cfg.minSecondsPerQuestion + ' 秒的要求', 'info');
-      return;
-    }
-
-    log('为避免作答时长过短，还需等待 ' + formatDuration(remainMs) +
-      '（要求 ' + this.stats.total + ' 题 × ' + cfg.minSecondsPerQuestion + ' 秒 = ' +
-      formatDuration(plan.requiredMs) + '）', 'warn');
-    UI.setStatus('running', '等待时长补足 ' + formatDuration(remainMs));
-
-    // 分片等待，每 60 秒报一次进度，同时保持对"停止"和"跳过等待"的响应
-    const deadline = Date.now() + remainMs;
-    let nextReport = remainMs - 60000;
-    this.waiting = true;
-    this.skipWaitFlag = false;
-    try {
-      while (Date.now() < deadline) {
-        if (this.stopFlag) { log('已停止等待，不会提交', 'warn'); return; }
-        if (this.skipWaitFlag) {
-          log('已跳过剩余等待，直接进入提交/保存环节', 'warn');
-          return;
-        }
-        const left = deadline - Date.now();
-        if (left <= 0) break;
-        if (left <= nextReport) {
-          log('剩余等待 ' + formatDuration(left) + '（不想等就点「跳过等待」）', 'info');
-          nextReport -= 60000;
-        }
-        await sleep(Math.min(5000, left));
-      }
-    } finally {
-      this.waiting = false;
-      this.skipWaitFlag = false;
-    }
-    log('作答时长已补足，继续', 'success');
-  },
-
-  /** 跳过剩余的最短作答时长等待。只在等待阶段有效，不改变"要不要提交" */
-  skipWait() {
-    if (!this.waiting) {
-      log('当前不在等待中，无需跳过', 'info');
-      return;
-    }
-    this.skipWaitFlag = true;
   },
 
   /**
@@ -938,7 +873,7 @@ const Runner = {
    * 之前"调了提交函数就算 done"，自动刷课拿着假 done 去跳节，
    * 作业实际没交，下一节还是同一份卷子。
    */
-  verifySubmitted(doc, seconds) {
+  verifySubmitted(doc, seconds, hadContainers) {
     const d = doc || this.doc || document;
     const t0 = Date.now();
     return new Promise((resolve) => {
@@ -949,7 +884,10 @@ const Runner = {
           if (/selectWorkQuestionYiPiYue|workReView|reVersionPaperMark|work\/view/.test(href)) return resolve(true);
         } catch (e) { /* 忽略 */ }
         try {
-          if (!d.querySelectorAll('.Py-mian1, .TiMu').length) return resolve(true);   // 题目容器没了 = 页面已切换
+          // "容器没了 = 页面已切换"只有在**原来就有容器**时才成立。新版 React 页面
+          // （靠 radio/checkbox 数量识别）从头就没有这两个容器，不做快照对比的话，
+          // 点提交后第一次检查就会假阳性"提交成功"。
+          if (hadContainers !== false && !d.querySelectorAll('.Py-mian1, .TiMu').length) return resolve(true);   // 题目容器没了 = 页面已切换
           if (/提交成功/.test(d.body ? d.body.textContent : '')) return resolve(true);
         } catch (e) { /* 忽略 */ }
         if (Date.now() - t0 > (seconds || 15) * 1000) return resolve(false);
@@ -1052,23 +990,18 @@ const Runner = {
           return;
         }
 
-        const btn = findButtonByText(SUBMIT_TEXTS, doc);
-        if (!btn) {
-          log('找不到提交按钮，先帮你把答案存下来。如果页面上确实有提交按钮，把它的文字告诉我', 'error');
-          const saved = await this.trySave(doc, cfg);
-          UI.setStatus('warn', saved ? '已保存（未提交）' : '找不到提交按钮');
-          this.lastResult = {
-            status: saved ? 'done' : 'filled',
-            reason: saved ? '只保存了，没找到提交按钮' : '找不到提交按钮',
-            rate: rate, saved: saved, submitted: false,
-          };
-          return;
-        }
         UI.setStatus('running', '正在提交…');
         const guard = (m) => !UNSAFE_CONFIRM.test(m);
+        // 提交前先快照：这份文档本来有没有题目容器。下面"容器消失=已切换"的
+        // 成功信号只对本来就有容器的文档成立——新版 React 页面靠 radio/checkbox
+        // 数量识别，从头就没有 .TiMu/.Py-mian1，不做对比会在第一次检查就假阳性。
+        const hadQuizContainers = (() => {
+          try { return !!doc.querySelector('.Py-mian1, .TiMu'); } catch (e) { return true; }
+        })();
 
-        // 优先调页面自带的提交函数：不经过按钮，也不会被"未完成"确认框卡住，
-        // 该拦的由 guard 拦。原脚本走的就是 submitCheckTimes()。
+        // 优先调页面自带的提交函数：不经过按钮，不怕按钮文案变，
+        // 也不会被"未完成"确认框卡住，该拦的由 guard 拦。原脚本走的就是 submitCheckTimes()。
+        // 之前它被排在"必须先找到提交按钮"后面，按钮文案一变这条最稳的路就死了。
         const pageFn = findPageFn(doc, SUBMIT_FNS);
         if (pageFn) {
           const lr = await callWithGuard(pageFn.win, guard, () => pageFn.fn.call(pageFn.win));
@@ -1090,7 +1023,7 @@ const Runner = {
             // done 去跳节，作业实际没交，下一节还是同一份卷子。
             // 验证信号照原脚本：提交成功后页面会跳到已批阅页，或题目容器消失。
             log('已调用页面自带的 ' + pageFn.name + '() 提交，等待提交结果…', 'info');
-            const okSubmit = await this.verifySubmitted(doc);
+            const okSubmit = await this.verifySubmitted(doc, 15, hadQuizContainers);
             if (okSubmit) {
               log('提交成功（页面已跳到批阅页/题目已清空）', 'success');
               UI.setStatus('done', '已提交');
@@ -1112,6 +1045,19 @@ const Runner = {
           log('调用 ' + pageFn.name + '() 出错：' + lr.error.message + '，改用点按钮', 'warn');
         }
 
+        // 页面函数不存在或调用失败时，才退回点提交按钮
+        const btn = findButtonByText(SUBMIT_TEXTS, doc);
+        if (!btn) {
+          log('找不到提交按钮，也没找到页面自带的提交函数（试过 ' + SUBMIT_FNS.join('/') + '）。先帮你把答案存下来；如果页面上确实有提交按钮，把它的文字告诉我', 'error');
+          const saved = await this.trySave(doc, cfg);
+          UI.setStatus('warn', saved ? '已保存（未提交）' : '找不到提交按钮');
+          this.lastResult = {
+            status: saved ? 'done' : 'filled',
+            reason: saved ? '只保存了，没找到提交按钮' : '找不到提交按钮',
+            rate: rate, saved: saved, submitted: false,
+          };
+          return;
+        }
         // 兜底：点提交按钮
         const r = await clickWithConfirm(btn, { guard: guard });
         if (r.blocked) {
@@ -1127,7 +1073,7 @@ const Runner = {
           return;
         }
         log('已点击提交，等待提交结果…', 'info');
-        const okSubmitBtn = await this.verifySubmitted(doc);
+        const okSubmitBtn = await this.verifySubmitted(doc, 15, hadQuizContainers);
         if (okSubmitBtn) {
           log('提交成功（页面已跳到批阅页/题目已清空）', 'success');
           UI.setStatus('done', '已提交');
@@ -1227,10 +1173,8 @@ const Runner = {
       log('按当前设置脚本不自动保存，答案只在页面上，别刷新页面', 'warn');
       return false;
     }
-    if (!this.stats || !this.stats.answered) {
-      log('没有填入任何答案，无需保存', 'info');
-      return false;
-    }
+    // 不看 stats.answered 就拒绝保存——模型全程没填上时，页面上可能还有
+    // 用户手填的答案，拒存会连它们一起丢（自动刷课随后会关掉作业窗口）。
 
     // 1) 优先调页面自带的保存函数——原脚本用的就是这条路（noSubmit），
     //    比点按钮可靠：不怕按钮文案变，也不经过确认框那一层。
@@ -1251,7 +1195,11 @@ const Runner = {
       log('把「导出诊断」的结果发我，我按你的页面补上', 'warn');
       return false;
     }
-    await clickWithConfirm(btn);
+    const r = await clickWithConfirm(btn);
+    if (r && r.blocked) {
+      log('保存被超星拦下：' + r.msg + '。答案未必落库，请回页面确认', 'warn');
+      return false;
+    }
     log('已点击「' + (btn.textContent || '').trim() + '」，答案已保存到服务器', 'success');
     return true;
   },
@@ -1427,13 +1375,4 @@ function truncateText(s, n) {
   const t = String(s || '').replace(/\s+/g, ' ').trim();
   const max = n || 32;
   return t.length > max ? t.slice(0, max) + '…' : t;
-}
-
-// 把毫秒转成"X 分 Y 秒"，用于日志里展示等待时长
-function formatDuration(ms) {
-  const total = Math.max(0, Math.round(ms / 1000));
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  if (m <= 0) return s + ' 秒';
-  return m + ' 分' + (s ? ' ' + s + ' 秒' : '');
 }

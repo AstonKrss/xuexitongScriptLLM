@@ -9,13 +9,6 @@
 const VERSION = '__BUILD_VERSION__';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
-// 当前 frame 加载完成的绝对时刻，作为"作答时长"的计时起点。
-// 用 timeOrigin 而不是脚本初始化那一刻：超星如果要算时长，大概率是从页面进入算起，
-// 而不是从用户点按钮算起。口径偏保守的一侧更安全。
-const PAGE_STARTED_AT = (typeof performance !== 'undefined' && performance.timeOrigin)
-  ? performance.timeOrigin
-  : Date.now();
-
 /* ---------- 脚本管理器能力探测 ---------- */
 // Tampermonkey 新旧两套 API 并存：GM_xmlhttpRequest（回调式）与 GM.xmlHttpRequest（Promise 式）。
 // 这里统一收敛成回调式调用，两种都能用，ScriptCat 也覆盖在内。

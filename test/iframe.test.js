@@ -140,7 +140,6 @@ const api = new Function(`var UI_STUB = null;${code}\nreturn { Main, Parser, Run
   cfg.profiles.default.baseUrl = 'https://api.deepseek.com';
   cfg.quiz.fillDelayMin = 1;
   cfg.quiz.fillDelayMax = 2;
-  cfg.quiz.enforceMinDuration = false;
   api.Config.save();
 
   await api.Runner.start();

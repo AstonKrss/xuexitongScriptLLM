@@ -292,19 +292,6 @@ const UI = {
       <input type="text" id="f-vision" placeholder="例：glm-4.6v-flash">
     </div>
     <div style="margin-top:8px">
-      <label class="chk">
-    </div>
-    </div>
-  </div>
-  <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
-
-  <label class="chk"><input type="checkbox" id="f-duration"> 补足最短作答时长（避免提交过快）</label>
-  <div class="row2">
-    <div>
-      <label>最短作答(秒/题)</label>
-      <input type="number" id="f-minsec" min="0" max="120" step="5">
-    </div>
-    <div>
       <label>逐题间隔(秒)</label>
       <div style="display:flex;gap:6px;align-items:center">
         <input type="number" id="f-dmin" min="0" max="60" step="1">
@@ -313,7 +300,7 @@ const UI = {
       </div>
     </div>
   </div>
-  <p class="hint">最短作答时长按"题数 × 秒数"算，20 题 × 25 秒 = 8 分 20 秒。脚本填得比人快得多，这一步是为了让作答时长落在合理区间。嫌久可以把秒数调小、取消这个勾，或者跑完直接点面板上的 <b>跳过等待</b>。</p>
+  <p class="hint">覆盖率指"成功填入答案的题数占比"，不是正确率 —— 模型答得对不对，脚本无从得知。</p>
 
   <label>填完之后怎么做</label>
   <select id="f-finish">
@@ -350,6 +337,18 @@ const UI = {
       const act = btn.getAttribute('data-act');
       // 主按钮：同一个按钮，动作随当前页面类型切换
       if (act === 'main') {
+        // 探测窗口只有十几秒，慢加载的卷子会被永久当成"非答题页"。
+        // 点按钮时再复核一次：真有题就按答题页走，避免误启动整门课的自动刷课。
+        if (this.pageKind !== 'quiz') {
+          try {
+            const qdoc = Main.resolveQuizDoc(true);
+            const r = Parser.parse(qdoc);
+            if (r && r.questions.length) {
+              this.setPageKind('quiz');
+              log('重新探测发现了题目，按答题页处理', 'info');
+            }
+          } catch (e) { /* 复核失败按原判定走 */ }
+        }
         if (this.pageKind === 'quiz') {
           if (typeof CoursePilot !== 'undefined' && CoursePilot.running) {
             log('自动刷课正在运行，它会自己处理作业。要手动答题请先停止刷课', 'warn');
@@ -476,9 +475,6 @@ const UI = {
         cfg.bank.enabled = false;
         log('题库接口地址为空，已自动关闭题库优先', 'warn');
       }
-      cfg.quiz.enforceMinDuration = q('#f-duration').checked;
-      cfg.quiz.minSecondsPerQuestion = clampNum(q('#f-minsec').value, 0, 120, 25);
-      // 面板上以秒为单位，存配置时换算成毫秒，避免一个字段两套单位
       cfg.quiz.fillDelayMin = clampNum(q('#f-dmin').value, 0, 60, 3) * 1000;
       cfg.quiz.fillDelayMax = clampNum(q('#f-dmax').value, 0, 60, 8) * 1000;
       if (cfg.quiz.fillDelayMax < cfg.quiz.fillDelayMin) {
@@ -622,8 +618,6 @@ const UI = {
     q('#f-bankurl').value = bank.endpoint || BUILTIN_BANK.endpoint;
     q('#f-banktoken').value = bank.token || BUILTIN_BANK.token;
     this.syncBankInputs();
-    q('#f-duration').checked = !!quiz.enforceMinDuration;
-    q('#f-minsec').value = quiz.minSecondsPerQuestion;
     q('#f-dmin').value = Math.round((quiz.fillDelayMin || 0) / 1000);
     q('#f-dmax').value = Math.round((quiz.fillDelayMax || 0) / 1000);
 
@@ -709,6 +703,9 @@ const UI = {
     if (typeof CoursePilot === 'undefined') { log('自动刷课模块未加载', 'error'); return; }
     if (CoursePilot.running) {
       CoursePilot.stop();
+      // 刷课停了，正在后台答题的 Runner 也不能继续跑——不然它会把作业
+      // 做完甚至提交，用户明明点了停止
+      if (typeof Runner !== 'undefined' && Runner.running) Runner.stop();
       return;
     }
     if (!CoursePilot.available(document)) {

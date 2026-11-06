@@ -125,8 +125,6 @@ const DEFAULT_CONFIG = {
     cacheLimit: 3000,        // 缓存条数上限，超出按最久未用淘汰
     fillDelayMin: 3000,      // D-16 逐题最小间隔（毫秒）
     fillDelayMax: 8000,      // D-16 逐题最大间隔（毫秒）
-    enforceMinDuration: false, // D-17 是否启用最短作答时长控制。默认关闭：等 25 分钟的体验太差，且自动刷课模式下用户明确要求直接跳。想开就在设置里勾上
-    minSecondsPerQuestion: 25, // D-17 每题折合的最短秒数，总时长下限 = 题数 × 该值
     decodeFont: true,        // D-31 是否解码 .font-cxsecret 字体加密（见 45-font.js）
   },
 

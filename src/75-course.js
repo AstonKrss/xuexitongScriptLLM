@@ -115,11 +115,13 @@ const CoursePilot = {
 
   /**
    * 把 mArg 的 attachments 拆成待办任务。已完成（isPassed）和非任务点不收。
-   * @returns {{videos:Array, documents:Array, works:Array, defaults:Object, totalJobs:number}}
+   * 未知类型（job=true 但不是 video/document/workid）收进 unknown——
+   * 它们不算"已完成"，否则会被"本节任务点已全部完成"分支直接跳走。
+   * @returns {{videos:Array, documents:Array, works:Array, unknown:Array, defaults:Object, totalJobs:number}}
    */
   parseTasks(pageData) {
     const out = {
-      videos: [], documents: [], works: [],
+      videos: [], documents: [], works: [], unknown: [],
       defaults: (pageData && pageData.defaults) || {},
       totalJobs: 0,
     };
@@ -133,6 +135,7 @@ const CoursePilot = {
         case 'video': out.videos.push(item); break;
         case 'document': out.documents.push(item); break;
         case 'workid': out.works.push(item); break;
+        default: out.unknown.push(item); break;
       }
     }
     return out;
@@ -442,22 +445,38 @@ const CoursePilot = {
   },
 
   /**
-   * 当前小节的"身份指纹"：目录高亮节点 id + URL 章节 id + 任务清单里的 knowledgeid。
-   * 点了「下一节」之后拿它做前后对比——任何一项变了都说明真的切节了，
-   * 而不是点了个没绑事件的元素还自以为成功。
+   * 当前小节的"身份指纹"，三个分量：
+   *   active —— 目录高亮节点的 id
+   *   url    —— URL 上的章节 id
+   *   marg   —— 任务清单里的 knowledgeid（读不到时为 null）
+   * 返回对象而不是拼串：切节与否要按分量判断，iframe 瞬时加载中导致某个
+   * 分量"从有变无"不能当成切节的证据。
    */
   sectionSignature(d) {
-    let sig = '';
+    let active = '';
     try {
       const act = d.querySelector('.posCatalog_active');
-      sig += (act && act.id) || '';
+      active = (act && act.id) || '';
     } catch (e) { /* 忽略 */ }
-    sig += '|' + (queryVar('chapterId') || queryVar('knowledgeid') || '');
+    let url = '';
+    try { url = queryVar('chapterId') || queryVar('knowledgeid') || ''; } catch (e) { url = ''; }
+    let marg = null;
     try {
       const m = this.findMarg();
-      if (m && m.defaults) sig += '|' + (m.defaults.knowledgeid == null ? '' : m.defaults.knowledgeid);
-    } catch (e) { /* 忽略 */ }
-    return sig;
+      if (m && m.defaults && m.defaults.knowledgeid != null) marg = String(m.defaults.knowledgeid);
+    } catch (e) { marg = null; }
+    return { active: active, url: url, marg: marg };
+  },
+
+  /**
+   * 两个指纹是否构成"真的切节了"。只认"已知值 → 另一个已知值"的变化；
+   * 任何分量从有到无（或从无到有）都可能是 iframe 加载中的瞬时状态，不算数。
+   */
+  signatureMoved(before, after) {
+    if (before.active && after.active && before.active !== after.active) return true;
+    if (before.url && after.url && before.url !== after.url) return true;
+    if (before.marg != null && after.marg != null && before.marg !== after.marg) return true;
+    return false;
   },
 
   /** 从 URL 读课程/班级 id。超星参数大小写不统一，全部试一遍 */
@@ -551,11 +570,19 @@ const CoursePilot = {
         }
       }
 
+      // 「继续学习/去学习」只认弹层容器里的按钮。课程页上常有常驻的同名
+      // 入口，不加约束的话重试轮询会每 800ms 误点一次，把当前节重载一遍。
       const c = findButtonByText(['继续学习', '去学习'], d);
       if (c) {
-        try { c.click(); } catch (e) { /* 忽略 */ }
-        log('点掉了「继续学习」弹层', 'info');
-        return 'confirm';
+        let inOverlay = false;
+        try {
+          inOverlay = !!c.closest('[class*="layer"], [class*="dialog"], [class*="modal"], [class*="mask"], [class*="pop"]');
+        } catch (e) { inOverlay = false; }
+        if (inOverlay) {
+          try { c.click(); } catch (e) { /* 忽略 */ }
+          log('点掉了「继续学习」弹层', 'info');
+          return 'confirm';
+        }
       }
       return null;
     };
@@ -619,7 +646,7 @@ const CoursePilot = {
         const moved = await waitFor(() => {
           if (this.stopFlag) return true;
           if (handleDialogs() === 'cancel') { cancelledUnfinished = true; return true; }
-          return this.sectionSignature(d) !== sigBefore;
+          return this.signatureMoved(sigBefore, this.sectionSignature(d));
         }, 6000, 800);
         if (cancelledUnfinished) break;
         if (moved) return true;
@@ -640,11 +667,58 @@ const CoursePilot = {
   /* ---------- 任务执行（对照原脚本补齐的三块） ---------- */
 
   /**
+   * 数一下页面上已播完（ended）且时长正常的 video 元素个数。
+   * 用于识别"同一节二次进入"：mArg 是静态文本，isPassed 不会更新，
+   * 但页面上躺着一个已播完的播放器——这就是上一轮看过的证据。
+   */
+  countEndedVideos() {
+    let n = 0;
+    const walk = (win, depth) => {
+      if (depth > 3) return;
+      let doc = null;
+      try { doc = win.document; } catch (e) { return; }
+      if (!doc) return;
+      try {
+        const vids = doc.querySelectorAll('video');
+        for (const v of vids) {
+          if (v.ended && v.duration && isFinite(v.duration)) n++;
+        }
+      } catch (e) { /* 忽略 */ }
+      let frames = [];
+      try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (e) { return; }
+      for (const f of frames) {
+        let w = null;
+        try { w = f.contentWindow; } catch (e) { continue; }
+        if (w) walk(w, depth + 1);
+      }
+    };
+    walk(window, 0);
+    return n;
+  },
+
+  /**
    * 按清单执行本节任务。返回 false 表示有任务没做完（主循环会停下，不跳节）。
    */
   async runTaskList(tasks, doc) {
+    // ---- 未知类型的任务点：绝不绕过（项目底线）----
+    if (tasks.unknown && tasks.unknown.length) {
+      const names = tasks.unknown.map((t) => t.type || '?').join('、');
+      log('本节有 ' + tasks.unknown.length + ' 个脚本不认识的任务点（类型：' + names + '），无法确认能否自动完成', 'error');
+      log('为避免绕过任务点，自动刷课暂停。请手动处理这一节，或点「导出页面结构」发给作者补充支持', 'warn');
+      UI.setStatus('warn', '未知任务点，已暂停');
+      this.running = false;
+      return false;
+    }
+
     // ---- 视频 ----
+    // 进本清单时页面上已有的播完视频数。同一节二次进入时（作业失败后重试、
+    // 或切节假成功回到原节），视频早就播完了，但清单里 isPassed 还是 false——
+    // 不认这个账的话，findVideo 会因为 ended 被排除而永远找不到播放器，
+    // 最后"等 60 秒没出现"反复暂停，只有刷新页面能解。
+    const endedAtStart = this.countEndedVideos();
+    let videoIdx = -1;
     for (const item of tasks.videos) {
+      videoIdx++;
       if (this.stopFlag) return false;
       const name = (item.property && item.property.name) || '视频';
       log('播放视频：' + name, 'info');
@@ -657,7 +731,12 @@ const CoursePilot = {
       if (!v) v = await this.probeVideoByTab(doc);
       // 3) 点任务点图标把卡片展开（图标 class 各版本不一，多试几个选择器）
       if (!v) v = await this.probeVideoByIcon(doc);
-      // 4) 还没有就等用户手动点开（60 秒）
+      // 4) 进门时就已经播完的视频（清单排在前面）视为上一轮看过，不再等
+      if (!v && videoIdx < endedAtStart) {
+        log('视频「' + name + '」已播过（页面里有播完的播放器，清单状态未更新），跳过', 'info');
+        continue;
+      }
+      // 5) 还没有就等用户手动点开（60 秒）
       if (!v) {
         log('播放器没渲染出来。如果你看得到视频卡片，手动点开它，脚本会接手', 'warn');
         v = await this.waitVideoElement(60);
@@ -873,7 +952,7 @@ const CoursePilot = {
       let tasks = this.parseTasks(marg);
       let video = this.findVideo();
       let hw = this.detectHomework();
-      let taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length;
+      let taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length + tasks.unknown.length;
 
       // 刚进新节时，任务 iframe 往往还没加载完——清单和 DOM 都可能暂时是空的。
       // 什么都不检测就点「下一节」会把整节作业跳过去（实测踩过），多等两次再放弃。
@@ -885,7 +964,7 @@ const CoursePilot = {
           tasks = this.parseTasks(marg);
           video = video || this.findVideo();
           hw = hw || this.detectHomework();
-          taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length;
+          taskCount = tasks.videos.length + tasks.documents.length + tasks.works.length + tasks.unknown.length;
           if (video || hw || taskCount > 0 || tasks.totalJobs > 0) {
             log('等了 ' + ((retry + 1) * 3.5) + ' 秒才发现任务点（iframe 加载慢）', 'info');
             break;
@@ -915,7 +994,8 @@ const CoursePilot = {
 
       if (taskCount > 0) {
         log('本节任务（来自页面清单）：视频 ' + tasks.videos.length + '、文档 ' + tasks.documents.length +
-          '、作业 ' + tasks.works.length, 'info');
+          '、作业 ' + tasks.works.length +
+          (tasks.unknown.length ? '、未知类型 ' + tasks.unknown.length : ''), 'info');
         const ok = await this.runTaskList(tasks, this.doc || document);
         if (this.stopFlag || !this.running) break;
         if (!ok) break;   // runTaskList 内部已说明停在哪一步
@@ -1085,7 +1165,9 @@ const CoursePilot = {
     }
     let cfg = null;
     try { cfg = Config.load(); } catch (e) { cfg = null; }
-    const profile = cfg && cfg.profiles ? cfg.profiles[cfg.activeProfile] || cfg.profiles.default : null;
+    const profile = cfg && cfg.profiles
+      ? cfg.profiles[cfg.activeProfileId] || cfg.profiles.default || null
+      : null;
     if (!profile || !profile.apiKey) {
       log('还没配 API Key，没法自动答题。这一节留给你手动处理', 'warn');
       return false;
@@ -1097,8 +1179,7 @@ const CoursePilot = {
       try { Main.resolveQuizDoc(true); } catch (e) { /* 忽略 */ }
     }
 
-    // 自动刷课路径下不等最短作答时长：60 题 × 25 秒 = 25 分钟干等没有意义
-    if (typeof Runner !== 'undefined') Runner._pilotSkipWait = true;
+    // 自动刷课路径下不等最短作答时长（该功能已按作者要求移除）。
 
     // 用户可能同时点了「开始答题」。这时候 Runner 正在跑，start() 会立刻返回，
     // 让我们读到一份过期的结果，白白判成"没做完"。等它跑完再说。
@@ -1148,7 +1229,12 @@ const CoursePilot = {
     let flag = null;
     try { flag = sessionStorage.getItem('llmq:pilot'); } catch (e) { return; }
     if (flag !== '1') return;
-    if (!this.available(document)) return;
+    if (!this.available(document)) {
+      // 现在不在课程页就别续了。不清标志的话，之后同一标签页随便打开
+      // 哪门课都会在 3 秒后"凭空"自动开刷
+      try { sessionStorage.removeItem('llmq:pilot'); } catch (e) { /* 忽略 */ }
+      return;
+    }
     log('检测到上一页的自动刷课还没结束，3 秒后继续', 'info');
     setTimeout(() => { this.start(); }, 3000);
   },

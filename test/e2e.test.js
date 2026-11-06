@@ -104,7 +104,7 @@ function setup(html) {
   // 注入 UI 桩，避免加载真实面板
   const prefix = `var UI = { setStatus: function(){}, mount: function(){}, openSettings: function(){} };\nvar unsafeWindow = undefined;\n`;
   // eslint-disable-next-line no-new-func
-  const api = new Function(`${prefix}${code}\nreturn { Config, Runner, Parser, AnswerCache, computeMinDurationWait, formatDuration };`)();
+  const api = new Function(`${prefix}${code}\nreturn { Config, Runner, Parser, AnswerCache };`)();
   return { api, dom, w };
 }
 
@@ -119,9 +119,6 @@ function setup(html) {
   cfg.profiles.default.model = 'deepseek-chat';
   cfg.quiz.fillDelayMin = 1;
   cfg.quiz.fillDelayMax = 2;
-  // 测试里关掉最短作答时长，否则 3 题 × 25 秒要真等 75 秒；
-  // 这段逻辑改用下面的纯函数断言来验证
-  cfg.quiz.enforceMinDuration = false;
   api.Config.save();
 
   const t0 = Date.now();
@@ -167,26 +164,6 @@ function setup(html) {
   ok(api.Runner.stats.cached === 3, `第二轮 3 题全部命中缓存（实际 ${api.Runner.stats.cached}）`);
 
   console.log(`\n耗时：首轮 ${elapsed}ms，次轮 ${Date.now() - t1}ms`);
-
-  /* ---------- 第三轮：最短作答时长的计算 ---------- */
-  console.log('\n[第三轮] 最短作答时长计算（纯函数）');
-  {
-    // 20 题 × 25 秒 = 500 秒，已过 60 秒 → 还差 440 秒
-    const a = api.computeMinDurationWait(20, 25, 0, 60000);
-    ok(a.requiredMs === 500000, `20题×25秒 = 500000ms（实际 ${a.requiredMs}）`);
-    ok(a.remainMs === 440000, `已过60秒还应等440000ms（实际 ${a.remainMs}）`);
-
-    // 已经超时就不该再等
-    const b = api.computeMinDurationWait(20, 25, 0, 600000);
-    ok(b.remainMs === 0, `已满足时等待为 0（实际 ${b.remainMs}）`);
-
-    // 关掉开关或秒数为 0 时，由调用方跳过，这里只验证公式本身不产生负数
-    const c = api.computeMinDurationWait(0, 25, 0, 0);
-    ok(c.remainMs === 0, `0 题时等待为 0（实际 ${c.remainMs}）`);
-
-    ok(api.formatDuration(500000) === '8 分 20 秒', `格式化 500 秒（实际 ${api.formatDuration(500000)}）`);
-    ok(api.formatDuration(45000) === '45 秒', `格式化 45 秒（实际 ${api.formatDuration(45000)}）`);
-  }
 
   console.log(`${'─'.repeat(40)}`);
   console.log(`通过 ${passed} 项，失败 ${failed} 项`);
