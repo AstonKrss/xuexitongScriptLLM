@@ -409,6 +409,77 @@ console.log('\n[任务清单 mArg]');
   ok(CP.findMarg(w) === null, '★ 带用户脚本标记的 script 不解析');
 }
 
+/* ---------- 步骤页签里的测验（mArg 不包含它们） ---------- */
+console.log('\n[步骤页签测验]');
+
+{
+  // 实测故障结构：「1 视频 / 2 章节测验」，mArg 只列视频，测验在页签上
+  const { CP, w } = setup(`<html><body>
+    <ul class="prev_ul">
+      <li class="active"><span>1 视频</span></li>
+      <li class=""><span>2 章节测验</span></li>
+    </ul>
+  </body></html>`);
+  const tabs = CP.findStepTabs();
+  ok(tabs.length === 1, '★ 只挑出测验页签，视频页签不算（实际 ' + tabs.length + '）');
+  ok(tabs[0].text.indexOf('章节测验') >= 0, '★ 认出「2 章节测验」');
+  void w;
+}
+
+{
+  // 各种测验类叫法都要认
+  const { CP } = setup(`<html><body>
+    <ul class="prev_ul">
+      <li>1 视频</li><li>2 章节测验</li><li>3 作业</li><li>4 讨论</li>
+    </ul>
+  </body></html>`);
+  const texts = CP.findStepTabs().map((t) => t.text);
+  ok(texts.length === 3, '★ 测验/作业/讨论三种都被识别（实际 ' + texts.length + '）');
+  ok(texts.every((t) => t.indexOf('视频') < 0), '视频页签不会被当成测验');
+}
+
+{
+  // 步骤条藏在 cards iframe 里也要能找到
+  const { CP, w } = setup('<html><body><iframe id="f"></iframe></body></html>');
+  const idoc = w.document.getElementById('f').contentDocument;
+  idoc.body.innerHTML = '<ul class="prev_ul"><li><span>1 视频</span></li><li><span>2 章节测验</span></li></ul>';
+  const tabs = CP.findStepTabs();
+  ok(tabs.length === 1 && tabs[0].text.indexOf('章节测验') >= 0, '★ iframe 里的测验页签也能找到');
+}
+
+{
+  // 已完成的页签要能识别出来，避免重复进去答题
+  const { CP, w } = setup(`<html><body>
+    <ul class="prev_ul">
+      <li><span>1 视频</span></li>
+      <li class="roundpoint blue"><span>2 章节测验</span></li>
+    </ul>
+  </body></html>`);
+  const tabs = CP.findStepTabs();
+  ok(tabs.length === 1, '页签本身能找到');
+  ok(CP.stepTabDone(tabs[0].el) === true, '★ roundpoint blue = 已完成，不再重复答题');
+  void w;
+}
+
+{
+  // 未完成的页签不能误判成已完成（否则又会跳过测验）
+  const { CP, w } = setup(`<html><body>
+    <ul class="prev_ul"><li><span>2 章节测验</span></li></ul>
+  </body></html>`);
+  const tabs = CP.findStepTabs();
+  ok(CP.stepTabDone(tabs[0].el) === false, '★ 普通页签不算已完成');
+  void w;
+}
+
+{
+  // 没有步骤条时安全返回空数组，不会抛错
+  const { CP } = setup('<html><body><div>普通页面</div></body></html>');
+  let threw = false;
+  let tabs = null;
+  try { tabs = CP.findStepTabs(); } catch (e) { threw = true; }
+  ok(!threw && Array.isArray(tabs) && tabs.length === 0, '★ 没有步骤条时安全返回空数组');
+}
+
 console.log(`\n${'─'.repeat(44)}`);
 console.log(`通过 ${passed} 项，失败 ${failed} 项`);
 process.exit(failed > 0 ? 1 : 0);

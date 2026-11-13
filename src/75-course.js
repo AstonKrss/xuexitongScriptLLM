@@ -300,7 +300,9 @@ const CoursePilot = {
       let cands = [];
       try { cands = Array.from(d.querySelectorAll('a, div, span, li')); } catch (e) { continue; }
       for (const el of cands) {
-        if (!el.getClientRects || el.getClientRects().length === 0) continue;
+        // 同 findStepTabs：getClientRects 在滚动容器/jsdom 里会是 0，
+        // 用它筛会把页签全滤掉，改用统一的 isVisible
+        if (!isVisible(el)) continue;
         const tx = (el.textContent || '').replace(/\s+/g, '');
         if (!tx || tx.length > 12) continue;
         if (tx.indexOf('视频') < 0) continue;
@@ -408,18 +410,17 @@ const CoursePilot = {
     // 否则 total 会是 NaN，后面的超时计算和进度百分比全部失效。
     if (!(v.duration && isFinite(v.duration))) {
       log('播放器已出现，等它加载视频信息…', 'info');
-      const got = await waitFor(() => !!(v.duration && isFinite(v.duration)), 30000, 500);
+      let got = await waitFor(() => !!(v.duration && isFinite(v.duration)), 30000, 500);
       if (!got) {
-        log('30 秒内没拿到视频信息（时长）。可能是网络慢或播放器报错，自动刷课暂停', 'error');
-        // 试着播一下：有的播放器必须先 play() 才会去拉元数据
-        try {
-          v.muted = true;
-          await v.play();
-          const got2 = await waitFor(() => !!(v.duration && isFinite(v.duration)), 15000, 500);
-          if (!got2) return false;
-        } catch (e) {
-          return false;
-        }
+        // 有的播放器必须先 play() 才会去拉元数据，这里试一次
+        try { v.muted = true; await v.play(); } catch (e) { /* 下面还会再判断 */ }
+        got = await waitFor(() => !!(v.duration && isFinite(v.duration)), 15000, 500);
+      }
+      if (!got) {
+        // 只有在真的拿不到时长时才报错——之前先打"已暂停"再成功播放，
+        // 日志自相矛盾，看着像出错了其实没出错
+        log('45 秒内没拿到视频信息（时长），播放器可能报错了。自动刷课暂停', 'error');
+        return false;
       }
     }
 
@@ -891,6 +892,111 @@ const CoursePilot = {
       if (!ok) return false;
     }
 
+    // ---- 步骤页签里的测验（mArg 不包含它们）----
+    // mooc2 的「1 视频 / 2 章节测验」结构里，清单只列视频，测验在页签上。
+    // 不补这一步，视频播完就跳节，测验被整个绕过。
+    const tabsOk = await this.processStepTabs(tasks.defaults, doc);
+    if (this.stopFlag) return false;
+    if (!tabsOk) return false;
+
+    return true;
+  },
+
+  /**
+   * 找出 cards 页步骤条里的测验类页签（视频/学习目标之外的那些）。
+   * 抽成独立方法便于单测：本函数只认页签，不点、不答题。
+   * @returns {Array<{el:Element, text:string}>}
+   */
+  findStepTabs() {
+    const KEY = /测验|作业|测试|考试|讨论|问答/;
+    const tabs = [];
+    const seen = {};
+    for (const d of this.allDocs()) {
+      let els = [];
+      try { els = Array.from(d.querySelectorAll('.prev_ul li, .prev_ul a, .prev_ul span')); } catch (e) { continue; }
+      for (const el of els) {
+        // 不能用 getClientRects 判可见：滚动容器里的元素、以及 jsdom 环境
+        // 都会返回 0，结果整个步骤条被过滤掉、测验又被跳过。
+        // isVisible 是项目里统一的宽松判定（看尺寸 + 计算样式）。
+        if (!isVisible(el)) continue;
+        const tx = (el.textContent || '').replace(/\s+/g, '');
+        if (!tx || tx.length > 16) continue;
+        if (!KEY.test(tx)) continue;          // 只管测验类步骤，视频/学习目标已经处理过
+        if (seen[tx]) continue;               // 同一个页签在多层文档里重复出现
+        seen[tx] = true;
+        tabs.push({ el: el, text: tx });
+      }
+    }
+    return tabs;
+  },
+
+  /** 页签是否已标记完成（已批阅 / 已完成 / 打勾） */
+  stepTabDone(el) {
+    let mark = '';
+    try { mark = (el.className || '') + ' ' + (el.innerHTML || ''); } catch (e) { mark = ''; }
+    return /已完成|已批阅|icon_Completed|roundpoint\s+blue/i.test(mark);
+  },
+
+  /**
+   * 处理 cards 页的步骤页签里、mArg 清单没有覆盖到的任务点。
+   *
+   * 为什么需要这一步：超星 mooc2 的一节可以是「1 视频 / 2 章节测验」这种多步骤
+   * 结构，而 mArg 的 attachments 里**只列视频**，测验根本不写进去。
+   * 于是视频播完、清单判"全做完"，脚本直接跳下一节——测验标签从头到尾没点过。
+   * 实际故障就是这样：2.3 那节视频刷完了，2 章节测验被整个绕过。
+   *
+   * @returns {Promise<boolean>} false 表示有测验没做完（主循环应停下，不跳节）
+   */
+  async processStepTabs(defaults, doc) {
+    const tabs = this.findStepTabs();
+    if (!tabs.length) return true;
+
+    for (const t of tabs) {
+      if (this.stopFlag) return false;
+      // 已经批阅/完成的步骤不用再进
+      if (this.stepTabDone(t.el)) {
+        log('步骤「' + t.text + '」已标记完成，跳过', 'info');
+        continue;
+      }
+
+      log('发现步骤「' + t.text + '」（任务清单里没有它），切过去处理', 'info');
+      UI.setStatus('running', t.text);
+      this.clickHard(t.el);
+
+      // 有的版本点开是作业列表，要先点「开始答题/进入作业」
+      let hw = await this.waitHomework(15);
+      if (!hw) {
+        const enter = findButtonByText(['开始答题', '进入作业', '去答题', '开始作答', '继续答题'], document);
+        if (enter) {
+          log('点「' + (enter.textContent || '').trim() + '」进入作业', 'info');
+          this.clickHard(enter);
+          hw = await this.waitHomework(20);
+        }
+      }
+      if (!hw) {
+        // 点开了却没有题：可能本来就已完成（列表页显示"已完成"），也可能结构不认识。
+        // 这里不硬判成功——继续往下走，但把话说清楚，便于事后核对。
+        log('步骤「' + t.text + '」打开后没检测到题目，按已完成处理；如果不放心请回本节看一眼', 'warn');
+        continue;
+      }
+
+      const ok = await this.runHomework();
+      if (this.stopFlag) return false;
+      if (!ok) {
+        log('步骤「' + t.text + '」的作业没做完，自动刷课已暂停 —— 继续往下会把它绕过去', 'error');
+        UI.setStatus('warn', '作业未完成，已暂停');
+        this.running = false;
+        return false;
+      }
+      this.closeWorkFrame(doc);
+      await sleep(3000);
+
+      // 交完卷通常停在批阅页，点「返回」回到本节，不然后面的步骤没得点
+      const back = findButtonByText(['返回', '返 回', '返回课程'], document);
+      if (back) {
+        try { this.clickHard(back); await sleep(2500); } catch (e) { /* 忽略 */ }
+      }
+    }
     return true;
   },
 
@@ -1226,9 +1332,13 @@ const CoursePilot = {
       log('第 ' + rounds + ' 轮：' + (video ? '有视频' : '无视频') + '，' + (hw ? '有作业' : '无作业') +
         '，' + (marg ? '任务清单已读到' : '无任务清单'), 'info');
 
-      // 清单里有任务点但全部已完成 → 本节本来就没活，直接下一节，
-      // 不用在 DOM 重试上白耗 7 秒
+      // 清单里有任务点但全部已完成 → 本节清单没活了。
+      // 但不能直接跳节：步骤页签里的测验不在 mArg 里，得先过一遍。
       if (marg && tasks.totalJobs > 0 && taskCount === 0) {
+        const tabsDone = await this.processStepTabs(tasks.defaults, this.doc || document);
+        if (this.stopFlag || !this.running) break;
+        if (!tabsDone) break;
+
         log('本节任务点已全部完成，直接进入下一节', 'info');
         this.stats.sections++;
         await sleep(3000);
