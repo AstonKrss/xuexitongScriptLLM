@@ -173,9 +173,48 @@ console.log('\n[找视频]');
 }
 
 {
-  // 有 video 但元数据没加载（duration 为 NaN）→ 不能返回它
+  // 有 video 但元数据没加载（duration 为 NaN）→ 严格判定不能返回它
   const { CP, w } = setup('<html><body><video></video></body></html>');
   ok(CP.findVideo(w) === null, '★ 元数据未加载的视频不能返回（播不了会卡住）');
+}
+
+{
+  // 但探测阶段要能看见它：播放器先有元素、后有时长，
+  // 卡 duration 会让整轮探测落空（v1.7.1 修的实际故障）
+  const { CP, w } = setup('<html><body><video id="v1"></video></body></html>');
+  const v = CP.findVideo(w, 0, true);
+  ok(!!v && v.id === 'v1', '★ allowNoMeta=true 时能返回元数据未加载的播放器');
+}
+
+{
+  // 已播完的视频即便 allowNoMeta 也不能返回（否则 play() 立即 ended 死循环）
+  const { CP, w } = setup('<html><body><video id="v1"></video></body></html>');
+  const v = w.document.getElementById('v1');
+  Object.defineProperty(v, 'duration', { value: 600, configurable: true });
+  Object.defineProperty(v, 'ended', { value: true, configurable: true });
+  ok(CP.findVideo(w, 0, true) === null, '★ 已播完的视频不会被返回');
+}
+
+{
+  // allDocs 要把 iframe 里的文档收进来——任务卡片在 cards iframe 里
+  const { CP, w } = setup('<html><body><iframe id="f"></iframe></body></html>');
+  const idoc = w.document.getElementById('f').contentDocument;
+  idoc.body.innerHTML = '<div class="ans-job-icon"></div>';
+  const docs = CP.allDocs();
+  ok(docs.length >= 2, '★ allDocs 收集到顶层 + iframe 文档（实际 ' + docs.length + '）');
+  ok(docs.some((d) => d.querySelector && d.querySelector('.ans-job-icon')),
+    '★ iframe 里的任务卡片文档也在收集结果里');
+}
+
+{
+  // 自建播放器：有 objectid 就能拼出 URL，没有就明确返回空
+  const { CP } = setup('<html><body></body></html>', 'https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=9&clazzid=8');
+  const urls = CP.videoPlayerUrls({ jobid: 'j1', property: { objectid: 'oid-123' } }, { knowledgeid: 'k1' });
+  ok(urls.length > 0, '★ 有 objectid 时能拼出播放器地址');
+  ok(urls[0].indexOf('oid-123') >= 0 && urls[0].indexOf('/ananas/modules/video/') >= 0,
+    '★ 地址含 objectid 和 ananas 视频模块路径');
+  const none = CP.videoPlayerUrls({ property: { name: 'x' } }, {});
+  ok(none.length === 0, '★ 没有 objectid 时不瞎拼地址');
 }
 
 /* ---------- 续跑标志 ---------- */

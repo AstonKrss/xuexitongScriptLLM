@@ -856,6 +856,46 @@ const UI = {
       }
     } catch (e) { /* 附加失败不影响主体导出 */ }
 
+    // 视频探测信息：这次"mArg 有视频任务点却报播放器没渲染"就是缺了这一段才难定位。
+    // 把每一层探测的结果都列出来——一眼能看出是卡片没渲染、还是点了没反应。
+    try {
+      if (typeof CoursePilot !== 'undefined' && CoursePilot.findMarg) {
+        const marg = CoursePilot.findMarg(window);
+        const tasks = CoursePilot.parseTasks(marg);
+        if (tasks.videos.length) {
+          text += '\n\n=== 视频探测 ===\n';
+          const docs = CoursePilot.allDocs ? CoursePilot.allDocs() : [document];
+          text += '可访问文档数: ' + docs.length + '\n';
+          let vidCount = 0;
+          docs.forEach((d, i) => {
+            let n = 0;
+            try { n = d.querySelectorAll('video').length; } catch (e) { n = 0; }
+            vidCount += n;
+            if (n) text += '  文档#' + i + ' 有 ' + n + ' 个 <video>\n';
+          });
+          text += '全页 <video> 总数: ' + vidCount + '\n';
+          // 卡片候选：各版本选择器命中数，判断卡片到底渲染没渲染
+          const cardSels = ['.ans-job-icon', '[class*="job-icon"]', '.ans-insertvideo-online',
+            '[class*="insertvideo"]', '.ans-attach-online', '[objectid]', '.prev_ul li'];
+          docs.forEach((d, i) => {
+            const hits = [];
+            for (const sel of cardSels) {
+              let n = 0;
+              try { n = d.querySelectorAll(sel).length; } catch (e) { n = 0; }
+              if (n) hits.push(sel + '=' + n);
+            }
+            if (hits.length) text += '  文档#' + i + ' 卡片候选: ' + hits.join('、') + '\n';
+          });
+          for (const it of tasks.videos) {
+            const oid = (it.property && it.property.objectid) || '';
+            const list = CoursePilot.videoPlayerUrls ? CoursePilot.videoPlayerUrls(it, tasks.defaults) : [];
+            text += '  [视频] ' + ((it.property && it.property.name) || '(无名)') +
+              ' objectid=' + (oid || '(缺)') + ' 可自建播放器=' + (list.length ? '是' : '否') + '\n';
+          }
+        }
+      }
+    } catch (e) { /* 附加失败不影响主体导出 */ }
+
     this.outputBlock('页面结构导出',
       text,
       '页面结构已复制到剪贴板，直接发我就行（内容也打到了控制台）',

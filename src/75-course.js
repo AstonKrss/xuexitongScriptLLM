@@ -210,57 +210,127 @@ const CoursePilot = {
     });
   },
 
-  /** 等视频元素出现（进新节后 iframe 加载需要时间） */
+  /**
+   * 等视频元素出现（进新节后 iframe 加载需要时间）。
+   * 用 allowNoMeta 而不是严格判定：播放器先出现元素、后拿到时长，
+   * 按严格判定等会把刚渲染出来的播放器当成"没出现"。
+   */
   async waitVideoElement(seconds) {
-    const deadline = Date.now() + seconds * 1000;
-    while (Date.now() < deadline && !this.stopFlag) {
-      const v = this.findVideo();
-      if (v) return v;
-      await sleep(1500);
-    }
-    return null;
+    return this.waitPlayableVideo(seconds);
   },
 
   /**
-   * 点顶部步骤页签（「2视频」/「视频」）把当前步骤切到视频。
-   * cards 页面进入小节后常先停在「学习目标」步骤，播放器不渲染——
-   * 不切步骤就永远等不到 video 元素（chaolucky 项目验证过的路径）。
+   * 收集当前窗口及所有同源 iframe 的 document。
+   * 视频卡片不在顶层——mooc2 把整节内容渲染在 knowledge/cards 这个 iframe 里，
+   * 只在顶层 document 找任务卡片是永远找不到的（实测踩过：mArg 明明有视频任务点，
+   * 四层探测却全部落空，最后报"播放器没渲染出来"）。
+   */
+  allDocs() {
+    if (typeof Main !== 'undefined' && typeof Main.collectDocs === 'function') {
+      try {
+        const docs = Main.collectDocs();
+        if (docs && docs.length) return docs;
+      } catch (e) { /* 退回到自己走 */ }
+    }
+    const out = [document];
+    const walk = (d, depth) => {
+      if (depth > 4) return;
+      let frames = [];
+      try { frames = Array.from(d.querySelectorAll('iframe')); } catch (e) { return; }
+      for (const f of frames) {
+        let fd = null;
+        try { fd = f.contentDocument; } catch (e) { fd = null; }
+        if (!fd || !fd.documentElement) continue;
+        out.push(fd);
+        walk(fd, depth + 1);
+      }
+    };
+    walk(document, 0);
+    return out;
+  },
+
+  /**
+   * 尽量完整地"点一下"：先滚到视口内，再派发整套鼠标事件。
+   * 两件事都必须做：
+   *   1) 超星的播放器是**懒加载**的——卡片滚进视口才会创建 ananas iframe，
+   *      不滚只 click 等于点空气；
+   *   2) 部分版本的事件绑在 mousedown/mouseup 上，只派发 click 不触发。
+   */
+  clickHard(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { /* 忽略 */ }
+    let ok = false;
+    try {
+      const doc = el.ownerDocument || document;
+      const view = doc.defaultView || window;
+      const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 0, top: 0, width: 2, height: 2 };
+      const opts = {
+        bubbles: true, cancelable: true, view: view,
+        clientX: rect.left + (rect.width || 2) / 2,
+        clientY: rect.top + (rect.height || 2) / 2,
+        button: 0,
+      };
+      for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        let ev = null;
+        try {
+          ev = (t.indexOf('pointer') === 0 && typeof view.PointerEvent === 'function')
+            ? new view.PointerEvent(t, opts)
+            : new view.MouseEvent(t, opts);
+        } catch (e) { ev = null; }
+        if (ev) { try { el.dispatchEvent(ev); ok = true; } catch (e) { /* 忽略 */ } }
+      }
+    } catch (e) { /* 继续试 el.click() */ }
+    try { el.click(); ok = true; } catch (e) { /* 忽略 */ }
+    return ok;
+  },
+
+  /**
+   * 把当前步骤切到视频。
+   * 两条路都走一遍：
+   *   1) 文字含「视频」的短页签——文字常带编号（「2.1 视频」「2视频」都有），
+   *      不能精确匹配；
+   *   2) mooc2 的步骤条 .prev_ul li——不靠文字，逐个点过去，最可靠。
    * @returns {Element|null} 点完页签后出现的播放器
    */
   async probeVideoByTab(doc) {
-    const walk = async (w, depth) => {
-      if (depth > 4) return null;
-      let d = null;
-      try { d = w.document; } catch (e) { return null; }
-      if (!d) return null;
-      for (const t of ['2视频', '视频']) {
-        let el = null;
-        try {
-          el = Array.from(d.querySelectorAll('a, div, span, li')).find((e2) => {
-            if (!e2.getClientRects || e2.getClientRects().length === 0) return false;
-            const tx = (e2.textContent || '').replace(/\s+/g, '');
-            return tx === t;
-          });
-        } catch (e2) { el = null; }
-        if (el) {
-          try { el.click(); } catch (e2) { continue; }
-          await sleep(2000);
-          const v = this.findVideo();
-          if (v) return v;
+    const docs = this.allDocs();
+
+    // 1) 文字含「视频」的叶子页签
+    for (const d of docs) {
+      let cands = [];
+      try { cands = Array.from(d.querySelectorAll('a, div, span, li')); } catch (e) { continue; }
+      for (const el of cands) {
+        if (!el.getClientRects || el.getClientRects().length === 0) continue;
+        const tx = (el.textContent || '').replace(/\s+/g, '');
+        if (!tx || tx.length > 12) continue;
+        if (tx.indexOf('视频') < 0) continue;
+        // 只看叶子，避免把整个容器当成页签点
+        try { if (el.querySelector('a, div, span, li')) continue; } catch (e) { continue; }
+        this.clickHard(el);
+        const v = await this.waitVideoElement(6);
+        if (v) {
+          log('切到「' + tx + '」步骤后播放器已出现', 'info');
+          return v;
         }
       }
-      let frames = [];
-      try { frames = Array.from(d.querySelectorAll('iframe')); } catch (e2) { return null; }
-      for (const f of frames) {
-        let w2 = null;
-        try { w2 = f.contentWindow; } catch (e2) { continue; }
-        if (!w2) continue;
-        const r = await walk(w2, depth + 1);
-        if (r) return r;
+    }
+
+    // 2) mooc2 步骤条：先点文字含「视频」的，没有再逐个点
+    for (const d of docs) {
+      let lis = [];
+      try { lis = Array.from(d.querySelectorAll('.prev_ul li')); } catch (e) { continue; }
+      if (!lis.length) continue;
+      const videoLis = lis.filter((li) => (li.textContent || '').indexOf('视频') >= 0);
+      for (const li of (videoLis.length ? videoLis : lis)) {
+        this.clickHard(li);
+        const v = await this.waitVideoElement(6);
+        if (v) {
+          log('点步骤条「' + (li.textContent || '').replace(/\s+/g, '').slice(0, 8) + '」后播放器已出现', 'info');
+          return v;
+        }
       }
-      return null;
-    };
-    return walk((doc && doc.defaultView) || window, 0);
+    }
+    return null;
   },
 
   /** 等作业页面出现 */
@@ -279,8 +349,11 @@ const CoursePilot = {
   /**
    * 递归找播放器。超星的视频在 ananas 的 iframe 里，层级不固定，
    * 所以按帧树往下摸，最多三层。
+   * @param {boolean} [allowNoMeta] 允许返回"元数据还没加载"（duration 为 NaN）的 video。
+   *        侦测阶段要用 true——播放器是先有元素、后有时长的，卡 duration 会让
+   *        整轮探测全部落空（实测：mArg 有视频任务点却报"播放器没渲染出来"）。
    */
-  findVideo(win, depth) {
+  findVideo(win, depth, allowNoMeta) {
     win = win || window;
     depth = depth || 0;
     if (depth > 3) return null;
@@ -288,11 +361,14 @@ const CoursePilot = {
     try { doc = win.document; } catch (e) { return null; }
     if (!doc) return null;
 
-    let v = null;
-    try { v = doc.querySelector('video'); } catch (e) { v = null; }
-    // 没有 duration 说明还没加载出元数据，此时播不了；
-    // 已经播完的（ended）也不能再返回——否则会对着它 play() → 立即 ended → 死循环
-    if (v && v.duration && isFinite(v.duration) && !v.ended) return v;
+    let vids = [];
+    try { vids = Array.from(doc.querySelectorAll('video')); } catch (e) { vids = []; }
+    for (const v of vids) {
+      // 已经播完的（ended）不能再返回——否则会对着它 play() → 立即 ended → 死循环
+      if (v.ended) continue;
+      const hasMeta = !!(v.duration && isFinite(v.duration));
+      if (hasMeta || allowNoMeta) return v;
+    }
 
     let frames = [];
     try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (e) { return null; }
@@ -300,8 +376,24 @@ const CoursePilot = {
       let w = null;
       try { w = f.contentWindow; } catch (e) { continue; }
       if (!w) continue;
-      const r = this.findVideo(w, depth + 1);
+      const r = this.findVideo(w, depth + 1, allowNoMeta);
       if (r) return r;
+    }
+    return null;
+  },
+
+  /**
+   * 等播放器元素出现（最多等 seconds 秒）。
+   * 一拿到元素就返回，不在这里等时长——时长由 playVideo 负责等，
+   * 否则每次探测都要白等一轮，逐个点页签时会很慢。
+   * @returns {HTMLVideoElement|null}
+   */
+  async waitPlayableVideo(seconds) {
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline && !this.stopFlag) {
+      const v = this.findVideo(window, 0, true);   // 容忍元数据未加载
+      if (v) return v;
+      await sleep(500);
     }
     return null;
   },
@@ -312,6 +404,25 @@ const CoursePilot = {
    * @returns {Promise<boolean>} 是否真的播完了
    */
   async playVideo(v) {
+    // 进来时元数据可能还没加载（duration 为 NaN）。等它到齐再算时长，
+    // 否则 total 会是 NaN，后面的超时计算和进度百分比全部失效。
+    if (!(v.duration && isFinite(v.duration))) {
+      log('播放器已出现，等它加载视频信息…', 'info');
+      const got = await waitFor(() => !!(v.duration && isFinite(v.duration)), 30000, 500);
+      if (!got) {
+        log('30 秒内没拿到视频信息（时长）。可能是网络慢或播放器报错，自动刷课暂停', 'error');
+        // 试着播一下：有的播放器必须先 play() 才会去拉元数据
+        try {
+          v.muted = true;
+          await v.play();
+          const got2 = await waitFor(() => !!(v.duration && isFinite(v.duration)), 15000, 500);
+          if (!got2) return false;
+        } catch (e) {
+          return false;
+        }
+      }
+    }
+
     const total = Math.round(v.duration);
     log('开始播放视频，时长 ' + Math.floor(total / 60) + ' 分 ' + (total % 60) + ' 秒' +
       '（1 倍速真实播放，不跳、不快进）', 'info');
@@ -724,19 +835,24 @@ const CoursePilot = {
       log('播放视频：' + name, 'info');
       UI.setStatus('running', '视频：' + name);
 
-      // 四层递进找播放器：
+      // 五层递进找播放器：
       // 1) 页面上已经渲染出来的 video（有的课程卡片直接内嵌）
-      let v = this.findVideo();
-      // 2) 点顶部步骤页签「2视频」——进节常先停在「学习目标」，不切步骤播放器不渲染
+      let v = this.findVideo(window, 0, true);
+      // 2) 点步骤页签把当前步骤切到「视频」——进节常先停在「学习目标」
       if (!v) v = await this.probeVideoByTab(doc);
-      // 3) 点任务点图标把卡片展开（图标 class 各版本不一，多试几个选择器）
+      // 3) 点任务卡片/图标把它展开（卡片在 cards iframe 里，且要滚进视口才懒加载）
       if (!v) v = await this.probeVideoByIcon(doc);
-      // 4) 进门时就已经播完的视频（清单排在前面）视为上一轮看过，不再等
+      // 4) 卡片点了也不出来 → 照 mArg 的 objectid 自己拉起 ananas 播放器
+      if (!v) {
+        log('页面上点不出播放器，改用任务清单里的 objectid 自建播放器', 'warn');
+        v = await this.openVideoInFrame(item, tasks.defaults, doc);
+      }
+      // 5) 进门时就已经播完的视频（清单排在前面）视为上一轮看过，不再等
       if (!v && videoIdx < endedAtStart) {
         log('视频「' + name + '」已播过（页面里有播完的播放器，清单状态未更新），跳过', 'info');
         continue;
       }
-      // 5) 还没有就等用户手动点开（60 秒）
+      // 6) 还不行就等用户手动点开（60 秒）
       if (!v) {
         log('播放器没渲染出来。如果你看得到视频卡片，手动点开它，脚本会接手', 'warn');
         v = await this.waitVideoElement(60);
@@ -753,6 +869,11 @@ const CoursePilot = {
       if (this.stopFlag) return false;
       if (!ok) { log('视频没有正常播完，自动刷课已暂停', 'warn'); this.running = false; return false; }
       this.stats.videos++;
+      // 自建播放器用完就撤，免得下一节复用它、对着上一个视频
+      try {
+        const dd = doc || document;
+        if (dd.getElementById && dd.getElementById('llmq-video-frame')) this.closeVideoFrame(dd);
+      } catch (e) { /* 忽略 */ }
       UI.setStatus('running', '等待上报…');
       await sleep(3000);
     }
@@ -774,22 +895,62 @@ const CoursePilot = {
   },
 
   /**
-   * 找任务点图标点开它，等播放器渲染出来。
-   * 图标 class 各版本不一，逐个选择器试，点错顶多是展开卡片，无害。
+   * 点开视频任务点，等播放器渲染出来。
+   *
+   * 两处以前踩过的坑：
+   *   1) 只在顶层 document 里找 —— mooc2 的卡片在 knowledge/cards iframe 里，
+   *      所以一个都找不到。这里改成遍历所有同源 iframe。
+   *   2) 只点图标 —— 超星真正绑事件的往往是卡片里的链接或整块卡片，
+   *      图标本身常常只是装饰。现在从最具体的图标一路试到整张卡片。
    */
   async probeVideoByIcon(doc) {
-    const d = doc || document;
-    const sels = ['.ans-job-icon', '[class*="job-icon"]', '.ans-insertvideo-online', '[class*="insertvideo"]'];
-    for (const sel of sels) {
-      let icons = [];
-      try { icons = Array.from(d.querySelectorAll(sel)); } catch (e) { continue; }
-      for (const ic of icons) {
-        try { ic.click(); } catch (e) { continue; }
-        await sleep(2000);
-        const v = this.findVideo();
-        if (v) {
-          log('点开任务点后播放器已出现', 'info');
-          return v;
+    const docs = this.allDocs();
+    const targetIds = new Set();
+    try {
+      const tasks = this.parseTasks(this.findMarg());
+      for (const it of tasks.videos) {
+        if (it.property && it.property.objectid) targetIds.add(String(it.property.objectid));
+      }
+    } catch (e) { /* 清单取不到就按选择器盲点 */ }
+
+    const sels = [
+      '.ans-job-icon', '[class*="job-icon"]', '.ans-insertvideo-online',
+      '[class*="insertvideo"]', '.ans-attach-online', '[objectid]',
+      '.ans-jobfinishtip', '.ans-item-title',
+    ];
+
+    for (const d of docs) {
+      for (const sel of sels) {
+        let els = [];
+        try { els = Array.from(d.querySelectorAll(sel)); } catch (e) { continue; }
+        // 清单里有 objectid 的优先——别的课程卡片混在同一页时别乱点
+        if (targetIds.size) {
+          const hit = els.filter((el) => {
+            const oid = el.getAttribute && (el.getAttribute('objectid') || el.getAttribute('object-id'));
+            const wrap = el.closest ? el.closest('[objectid], [object-id], .ans-attach-online') : null;
+            const oid2 = wrap && wrap.getAttribute ? (wrap.getAttribute('objectid') || wrap.getAttribute('object-id')) : null;
+            return (oid && targetIds.has(String(oid))) || (oid2 && targetIds.has(String(oid2)));
+          });
+          if (hit.length) els = hit;
+        }
+        for (const el of els) {
+          this.clickHard(el);
+          const v = await this.waitVideoElement(8);
+          if (v) {
+            log('点开任务卡片后播放器已出现', 'info');
+            return v;
+          }
+          // 卡片本身可能只是个壳，真正的入口在它内部的链接上
+          let inner = null;
+          try { inner = el.querySelector('a, .ans-attach-online, [class*="insertvideo"]'); } catch (e) { inner = null; }
+          if (inner && inner !== el) {
+            this.clickHard(inner);
+            const v2 = await this.waitVideoElement(8);
+            if (v2) {
+              log('点开任务卡片内的链接后播放器已出现', 'info');
+              return v2;
+            }
+          }
         }
       }
     }
@@ -867,6 +1028,92 @@ const CoursePilot = {
       if (f) f.remove();
       const box = d.getElementById('llmq-work-frame-box');
       if (box) box.remove();
+    } catch (e) { /* 忽略 */ }
+  },
+
+  /* ---------- 视频播放器兜底：自己拉起 ananas ----------
+   *
+   * 前三层探测（现成 video / 切步骤页签 / 点任务卡片）都失败时用这一招。
+   * 原理和 openWorkInFrame 一样：不依赖超星把卡片渲染出来，照着 mArg 里的
+   * objectid 自己把播放器 iframe 拉起来，然后照常 1 倍速真实播放。
+   *
+   * 为什么这一步是关键：mooc2 的卡片是懒加载的，卡片没进视口、或者页面上
+   * 根本没有卡片节点时，等再久也不会冒出 <video>。原脚本能刷、这里刷不动，
+   * 差别就在于它不指望卡片，直接按 objectid 开播放器。
+   */
+
+  /** ananas 播放器 iframe 地址（各版本路径不同，全部备着） */
+  videoPlayerUrls(item, defaults) {
+    const prop = (item && item.property) || {};
+    const objectId = String(prop.objectid || '');
+    if (!objectId) return [];
+    const courseId = defaults.courseid || defaults.courseId || queryVar('courseid') || queryVar('courseId') || '';
+    const clazzId = defaults.clazzId || queryVar('clazzId') || queryVar('clazzid') || '';
+    const fid = queryVar('fid') || queryVar('FID') || '';
+    const base = location.protocol + '//' + location.host;
+    const q = '?objectid=' + encodeURIComponent(objectId) +
+      '&courseid=' + encodeURIComponent(courseId) +
+      '&clazzid=' + encodeURIComponent(clazzId) +
+      '&knowledgeid=' + encodeURIComponent(defaults.knowledgeid || queryVar('knowledgeid') || '') +
+      '&jobid=' + encodeURIComponent(item.jobid || '') +
+      (fid ? '&fid=' + encodeURIComponent(fid) : '');
+    // 参数名大小写各版本不一致，两套都试
+    const alt = q.replace('objectid=', 'objectId=').replace('courseid=', 'courseId=').replace('clazzid=', 'clazzId=');
+    return [
+      base + '/ananas/modules/video/index.html' + q,
+      base + '/ananas/modules/video/index.html' + alt,
+      base + '/ananas/modules/audio/index.html' + q,
+    ];
+  },
+
+  /**
+   * 自己拉起播放器 iframe，等它里面的 video 可播。
+   * @returns {Promise<HTMLVideoElement|null>}
+   */
+  async openVideoInFrame(item, defaults, doc) {
+    const d = doc || document;
+    const urls = this.videoPlayerUrls(item, defaults);
+    if (!urls.length) {
+      log('任务清单里没有 objectid，无法自建播放器（这一节请手动点开视频）', 'warn');
+      return null;
+    }
+
+    const NAME = 'llmq-video-frame';
+    let f = null;
+    try { f = d.getElementById(NAME); } catch (e) { f = null; }
+    if (!f) {
+      try {
+        f = d.createElement('iframe');
+        f.id = NAME;
+        // 要真的"看得见"才会加载视频：超星播放器在 display:none 里不拉流
+        f.style.cssText = 'position:fixed;right:12px;bottom:12px;width:480px;height:320px;' +
+          'z-index:2147483646;border:2px solid #4a90d9;border-radius:8px;background:#000;';
+        f.setAttribute('allow', 'autoplay; fullscreen');
+        (d.body || d.documentElement).appendChild(f);
+        log('页面上的视频卡片没渲染出来，正在自建播放器（右下角小窗）', 'info');
+      } catch (e) {
+        log('创建播放器窗口失败：' + e.message, 'error');
+        return null;
+      }
+    }
+
+    for (const url of urls) {
+      if (this.stopFlag) return null;
+      try { f.src = url; } catch (e) { continue; }
+      const v = await this.waitPlayableVideo(20);
+      if (v) {
+        log('自建播放器已就绪（' + url.split('/ananas/')[1].split('?')[0] + '）', 'success');
+        return v;
+      }
+    }
+    return null;
+  },
+
+  closeVideoFrame(doc) {
+    try {
+      const d = doc || document;
+      const f = d.getElementById('llmq-video-frame');
+      if (f) f.remove();
     } catch (e) { /* 忽略 */ }
   },
 
