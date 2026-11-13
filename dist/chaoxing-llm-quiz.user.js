@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.7.2
+// @version      1.7.3
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.7.2';
+const VERSION = '1.7.3';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 /* ---------- 脚本管理器能力探测 ---------- */
@@ -8641,8 +8641,13 @@ const CoursePilot = {
         log('没有在本页任何 iframe 的 script 里找到任务清单（mArg），退回逐个找视频/作业的方式', 'info');
       }
 
+      // 清单计数直接打进轮次日志：出问题时"清单里到底有没有任务点"一眼可辨，
+      // 不用再靠导出诊断倒推（v1.7.2 排障时缺的就是这一眼）
       log('第 ' + rounds + ' 轮：' + (video ? '有视频' : '无视频') + '，' + (hw ? '有作业' : '无作业') +
-        '，' + (marg ? '任务清单已读到' : '无任务清单'), 'info');
+        '，' + (marg
+          ? '清单[视频' + tasks.videos.length + ' 文档' + tasks.documents.length +
+            ' 作业' + tasks.works.length + (tasks.unknown.length ? ' 未知' + tasks.unknown.length : '') + ']'
+          : '无任务清单'), 'info');
 
       // 清单里有任务点但全部已完成 → 本节清单没活了。
       // 但不能直接跳节：步骤页签里的测验不在 mArg 里，得先过一遍。
@@ -9936,6 +9941,17 @@ const Main = {
     // 1) 有 .Py-mian1 —— 超星手机版作业页的标志，最可靠
     for (const d of docs) {
       try { if (d.querySelectorAll('.Py-mian1').length) { found = d; break; } } catch (e) { /* 忽略单个文档的异常 */ }
+    }
+    // 1.5) 有 .TiMu —— 新版作业页（TiMu newTiMu）。这类卷子的选项是自定义控件
+    // （li[role=checkbox] + span[name=answercheck..]），页面上一个真实
+    // radio/checkbox input 都没有，第 2、3 条启发式都够不着它——
+    // 实测后果：探测报"找不到题目"、刷课报"作业页面 40 秒没就绪"，
+    // 3 道题摆在眼前却谁都没答（v1.7.2 的 2.3 章节测验就是这一类）。
+    // .TiMu 是超星作业页专属容器，课程页/卡片页都没有，误判风险很低。
+    if (!found) {
+      for (const d of docs) {
+        try { if (d.querySelectorAll('.TiMu').length) { found = d; break; } } catch (e) { /* 同上 */ }
+      }
     }
     // 2) 有 >=4 个单选/多选框
     if (!found) {

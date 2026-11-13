@@ -158,6 +158,57 @@ const api = new Function(`var UI_STUB = null;${code}\nreturn { Main, Parser, Run
   const p2 = api.Parser.parse(doc2);
   ok(p2.unsupported.indexOf('简答题') >= 0, '识别出卷面含简答题并标记为不支持');
 
+  /* ---------- 6. 新版作业页：TiMu + 自定义控件，零真实 input ---------- */
+  // 复现 v1.7.2 的 2.3 章节测验故障：这类卷子的选项是 li[role=checkbox] +
+  // span[name=answercheck..]，页面上一个真实 radio/checkbox/text input 都没有，
+  // resolveQuizDoc 的旧三条启发式全部够不着 → 探测报"找不到题目"、
+  // 刷课报"作业页面 40 秒没就绪"，3 道题摆在眼前谁都没答。
+  console.log('\n[6] 新版作业页定位（TiMu newTiMu + role=checkbox）');
+  {
+    const dom3 = new JSDOM('<html><body><div class="posCatalog_select"></div><iframe id="w"></iframe></body></html>',
+      { url: 'https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=1', pretendToBeVisual: true });
+    const savedDoc = global.document, savedWin = global.window;
+    global.document = dom3.window.document;
+    global.window = dom3.window;
+    try {
+      const idoc3 = dom3.window.document.getElementById('w').contentDocument;
+      // 结构照真实页面（用户导出的诊断）简化而来
+      idoc3.body.innerHTML = `
+        <div class="TiMu newTiMu" data="1">
+          <div class="Zy_TItle clearfix"><span class="newZy_TItle">【多选题】</span>推进国家安全体系和能力现代化的重大任务包括（）。</div>
+          <ul class="Zy_ulTop w-top fl">
+            <li role="checkbox" qid="500" qtype="1"><label class="fl before"><span class="num_option_dx" name="answercheck500" data="D">A</span></label><a class="fl after">完善社会治理体系</a></li>
+            <li role="checkbox" qid="500" qtype="1"><label class="fl before"><span class="num_option_dx" name="answercheck500" data="A">B</span></label><a class="fl after">不断健全国家安全体系</a></li>
+          </ul>
+          <input type="hidden" id="answer500" name="answer500" value="">
+        </div>
+        <div class="TiMu newTiMu" data="2">
+          <div class="Zy_TItle clearfix"><span class="newZy_TItle">【判断题】</span>国家安全体系已经完善。</div>
+          <ul class="Zy_ulTop w-top fl">
+            <li role="radio" qid="502" qtype="3"><label class="fl before"><span class="num_option" name="answer502" data="true">A</span></label><a class="fl after">对</a></li>
+            <li role="radio" qid="502" qtype="3"><label class="fl before"><span class="num_option" name="answer502" data="false">B</span></label><a class="fl after">错</a></li>
+          </ul>
+          <input type="hidden" id="answer502" name="answer502" value="">
+        </div>`;
+      eq(idoc3.querySelectorAll('input[type=radio],input[type=checkbox],input[type=text]').length, 0,
+        '新版卷子确实一个真实 input 都没有（复现故障前提）');
+      const found3 = api.Main.resolveQuizDoc(true);
+      ok(found3 === idoc3, '★ 靠 .TiMu 定位到新版作业文档（旧启发式永远找不到它）');
+      eq(api.Main.quizKind, 'quiz', '状态标记为答题页');
+      ok(api.Runner.doc === idoc3, 'Runner 的答题文档同步指向 iframe');
+      const r3 = api.Parser.parse(found3);
+      eq(r3.questions.length, 2, 'cx-pc 适配器解析出 2 题');
+      eq(r3.questions.map((q) => q.type), ['multi', 'judge'], '题型依次是 多选 / 判断');
+      ok(r3.questions[0].options.length === 2 && r3.questions[0].options[0].text === '完善社会治理体系',
+        '选项文本取自 <a>，不带字母前缀');
+    } finally {
+      global.document = savedDoc;
+      global.window = savedWin;
+      // 恢复后把 Main 的缓存指回原环境，免得影响后续断言
+      try { api.Main.resolveQuizDoc(true); } catch (e) { /* 忽略 */ }
+    }
+  }
+
   console.log(`\n${'─'.repeat(40)}`);
   console.log(`通过 ${passed} 项，失败 ${failed} 项`);
   process.exit(failed > 0 ? 1 : 0);

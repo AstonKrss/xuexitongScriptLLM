@@ -1329,8 +1329,13 @@ const CoursePilot = {
         log('没有在本页任何 iframe 的 script 里找到任务清单（mArg），退回逐个找视频/作业的方式', 'info');
       }
 
+      // 清单计数直接打进轮次日志：出问题时"清单里到底有没有任务点"一眼可辨，
+      // 不用再靠导出诊断倒推（v1.7.2 排障时缺的就是这一眼）
       log('第 ' + rounds + ' 轮：' + (video ? '有视频' : '无视频') + '，' + (hw ? '有作业' : '无作业') +
-        '，' + (marg ? '任务清单已读到' : '无任务清单'), 'info');
+        '，' + (marg
+          ? '清单[视频' + tasks.videos.length + ' 文档' + tasks.documents.length +
+            ' 作业' + tasks.works.length + (tasks.unknown.length ? ' 未知' + tasks.unknown.length : '') + ']'
+          : '无任务清单'), 'info');
 
       // 清单里有任务点但全部已完成 → 本节清单没活了。
       // 但不能直接跳节：步骤页签里的测验不在 mArg 里，得先过一遍。

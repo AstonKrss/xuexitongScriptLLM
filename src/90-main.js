@@ -107,6 +107,17 @@ const Main = {
     for (const d of docs) {
       try { if (d.querySelectorAll('.Py-mian1').length) { found = d; break; } } catch (e) { /* 忽略单个文档的异常 */ }
     }
+    // 1.5) 有 .TiMu —— 新版作业页（TiMu newTiMu）。这类卷子的选项是自定义控件
+    // （li[role=checkbox] + span[name=answercheck..]），页面上一个真实
+    // radio/checkbox input 都没有，第 2、3 条启发式都够不着它——
+    // 实测后果：探测报"找不到题目"、刷课报"作业页面 40 秒没就绪"，
+    // 3 道题摆在眼前却谁都没答（v1.7.2 的 2.3 章节测验就是这一类）。
+    // .TiMu 是超星作业页专属容器，课程页/卡片页都没有，误判风险很低。
+    if (!found) {
+      for (const d of docs) {
+        try { if (d.querySelectorAll('.TiMu').length) { found = d; break; } } catch (e) { /* 同上 */ }
+      }
+    }
     // 2) 有 >=4 个单选/多选框
     if (!found) {
       for (const d of docs) {
