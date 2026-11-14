@@ -409,75 +409,75 @@ console.log('\n[任务清单 mArg]');
   ok(CP.findMarg(w) === null, '★ 带用户脚本标记的 script 不解析');
 }
 
-/* ---------- 步骤页签里的测验（mArg 不包含它们） ---------- */
-console.log('\n[步骤页签测验]');
+/* ---------- 卡片页签（一节 = 多张卡片，每张卡片独立 mArg） ---------- */
+console.log('\n[卡片页签]');
 
 {
-  // 实测故障结构：「1 视频 / 2 章节测验」，mArg 只列视频，测验在页签上
+  // 实测故障结构：「1 视频 / 2 章节测验」是两张卡片，各有各的 mArg
   const { CP, w } = setup(`<html><body>
     <ul class="prev_ul">
-      <li class="active"><span>1 视频</span></li>
-      <li class=""><span>2 章节测验</span></li>
+      <li class="active" cardid="111"><span>1 视频</span></li>
+      <li class="" cardid="222"><span>2 章节测验</span></li>
     </ul>
   </body></html>`);
-  const tabs = CP.findStepTabs();
-  ok(tabs.length === 1, '★ 只挑出测验页签，视频页签不算（实际 ' + tabs.length + '）');
-  ok(tabs[0].text.indexOf('章节测验') >= 0, '★ 认出「2 章节测验」');
+  const tabs = CP.collectCardTabs();
+  ok(tabs.length === 2, '★ 两张卡片都收集到（实际 ' + tabs.length + '）');
+  ok(tabs[0].active === true, '★ 当前显示的卡片标记为 active');
+  ok(tabs[1].active === false, '非当前卡片不是 active');
+  ok(tabs[0].text === '1视频' && tabs[1].text === '2章节测验', '页签文字按顺序收集');
   void w;
 }
 
 {
-  // 各种测验类叫法都要认
-  const { CP } = setup(`<html><body>
-    <ul class="prev_ul">
-      <li>1 视频</li><li>2 章节测验</li><li>3 作业</li><li>4 讨论</li>
-    </ul>
-  </body></html>`);
-  const texts = CP.findStepTabs().map((t) => t.text);
-  ok(texts.length === 3, '★ 测验/作业/讨论三种都被识别（实际 ' + texts.length + '）');
-  ok(texts.every((t) => t.indexOf('视频') < 0), '视频页签不会被当成测验');
-}
-
-{
-  // 步骤条藏在 cards iframe 里也要能找到
+  // 页签藏在 iframe 里（有的版本整块渲染在 cards iframe 里）也要能找到
   const { CP, w } = setup('<html><body><iframe id="f"></iframe></body></html>');
   const idoc = w.document.getElementById('f').contentDocument;
-  idoc.body.innerHTML = '<ul class="prev_ul"><li><span>1 视频</span></li><li><span>2 章节测验</span></li></ul>';
-  const tabs = CP.findStepTabs();
-  ok(tabs.length === 1 && tabs[0].text.indexOf('章节测验') >= 0, '★ iframe 里的测验页签也能找到');
+  idoc.body.innerHTML = '<ul class="prev_ul"><li cardid="a"><span>1 视频</span></li><li cardid="b"><span>2 章节测验</span></li></ul>';
+  const tabs = CP.collectCardTabs();
+  ok(tabs.length === 2, '★ iframe 里的卡片页签也能找到（实际 ' + tabs.length + '）');
 }
 
 {
-  // 已完成的页签要能识别出来，避免重复进去答题
+  // 同一页签在顶层和 iframe 里重复出现时去重
   const { CP, w } = setup(`<html><body>
-    <ul class="prev_ul">
-      <li><span>1 视频</span></li>
-      <li class="roundpoint blue"><span>2 章节测验</span></li>
-    </ul>
+    <ul class="prev_ul"><li cardid="x"><span>1 视频</span></li></ul>
+    <iframe id="f"></iframe>
   </body></html>`);
-  const tabs = CP.findStepTabs();
-  ok(tabs.length === 1, '页签本身能找到');
-  ok(CP.stepTabDone(tabs[0].el) === true, '★ roundpoint blue = 已完成，不再重复答题');
-  void w;
+  const idoc = w.document.getElementById('f').contentDocument;
+  idoc.body.innerHTML = '<ul class="prev_ul"><li cardid="x"><span>1 视频</span></li></ul>';
+  const tabs = CP.collectCardTabs();
+  ok(tabs.length === 1, '★ 相同 cardid 的页签去重（实际 ' + tabs.length + '）');
 }
 
 {
-  // 未完成的页签不能误判成已完成（否则又会跳过测验）
-  const { CP, w } = setup(`<html><body>
-    <ul class="prev_ul"><li><span>2 章节测验</span></li></ul>
-  </body></html>`);
-  const tabs = CP.findStepTabs();
-  ok(CP.stepTabDone(tabs[0].el) === false, '★ 普通页签不算已完成');
-  void w;
-}
-
-{
-  // 没有步骤条时安全返回空数组，不会抛错
+  // 没有页签时安全返回空数组，不会抛错
   const { CP } = setup('<html><body><div>普通页面</div></body></html>');
   let threw = false;
   let tabs = null;
-  try { tabs = CP.findStepTabs(); } catch (e) { threw = true; }
-  ok(!threw && Array.isArray(tabs) && tabs.length === 0, '★ 没有步骤条时安全返回空数组');
+  try { tabs = CP.collectCardTabs(); } catch (e) { threw = true; }
+  ok(!threw && Array.isArray(tabs) && tabs.length === 0, '★ 没有卡片页签时安全返回空数组');
+}
+
+{
+  // margSnapshot：不同卡片的清单指纹不同，同卡片稳定
+  const { CP, w } = setup(`<html><body>
+    <script>
+      mArg = "";
+      try{
+          mArg = {"defaults":{"clazzId":"55","knowledgeid":"9"},"attachments":[{"type":"video","job":true}]};
+      }catch(e){}
+    </script>
+  </body></html>`);
+  const s1 = CP.margSnapshot();
+  const s2 = CP.margSnapshot();
+  ok(s1 === s2 && s1.indexOf('video') >= 0, '★ 同一卡片的快照稳定且含附件类型');
+  void w;
+}
+
+{
+  // 没有任何 mArg 时快照为 'null'（waitCardSwitch 靠它识别无清单卡片）
+  const { CP } = setup('<html><body><div>无清单</div></body></html>');
+  ok(CP.margSnapshot() === 'null', '★ 无 mArg 时快照为 null');
 }
 
 console.log(`\n${'─'.repeat(44)}`);

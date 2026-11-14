@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.7.3
+// @version      1.7.4
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.7.3';
+const VERSION = '1.7.4';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 /* ---------- 脚本管理器能力探测 ---------- */
@@ -8204,110 +8204,123 @@ const CoursePilot = {
       if (!ok) return false;
     }
 
-    // ---- 步骤页签里的测验（mArg 不包含它们）----
-    // mooc2 的「1 视频 / 2 章节测验」结构里，清单只列视频，测验在页签上。
-    // 不补这一步，视频播完就跳节，测验被整个绕过。
-    const tabsOk = await this.processStepTabs(tasks.defaults, doc);
-    if (this.stopFlag) return false;
-    if (!tabsOk) return false;
-
     return true;
   },
 
   /**
-   * 找出 cards 页步骤条里的测验类页签（视频/学习目标之外的那些）。
-   * 抽成独立方法便于单测：本函数只认页签，不点、不答题。
-   * @returns {Array<{el:Element, text:string}>}
+   * 当前卡片 mArg 的指纹：defaults + 各附件类型。
+   * 用于判断点击卡片页签后 iframe 是否真的换到了另一张卡片。
    */
-  findStepTabs() {
-    const KEY = /测验|作业|测试|考试|讨论|问答/;
+  margSnapshot() {
+    try {
+      const m = this.findMarg();
+      if (!m || !Array.isArray(m.attachments)) return 'null';
+      return JSON.stringify(m.defaults || {}) + '|' +
+        m.attachments.map((a) => (a && a.type) || '?').join(',');
+    } catch (e) { return 'err'; }
+  },
+
+  /**
+   * 收集本节所有卡片页签（顶层 .prev_ul li，按显示顺序）。
+   *
+   * 关键背景：一节的「1 视频 / 2 章节测验」不是同一页面的两个区块，而是
+   * **多张卡片**——点页签会让 iframe 重新加载 knowledge/cards?num=N，
+   * 每张卡片有自己的 mArg，只列**本卡片**的任务点。视频做完后 job 标记
+   * 会从清单里消失，当前卡片的 mArg 便是"全 0"——但这不代表本节做完了，
+   * 测验卡片还挂着任务（实测 2.3 靠这个判断跳节，测验被整个绕过）。
+   *
+   * 只认页签不点击，抽出来便于单测。
+   * @returns {Array<{el:Element, text:string, active:boolean}>}
+   */
+  collectCardTabs() {
     const tabs = [];
     const seen = {};
     for (const d of this.allDocs()) {
       let els = [];
-      try { els = Array.from(d.querySelectorAll('.prev_ul li, .prev_ul a, .prev_ul span')); } catch (e) { continue; }
+      try { els = Array.from(d.querySelectorAll('.prev_ul li')); } catch (e) { continue; }
       for (const el of els) {
-        // 不能用 getClientRects 判可见：滚动容器里的元素、以及 jsdom 环境
-        // 都会返回 0，结果整个步骤条被过滤掉、测验又被跳过。
-        // isVisible 是项目里统一的宽松判定（看尺寸 + 计算样式）。
+        // 不能用 getClientRects 判可见：滚动容器里恒为 0，会把页签全滤掉
         if (!isVisible(el)) continue;
-        const tx = (el.textContent || '').replace(/\s+/g, '');
-        if (!tx || tx.length > 16) continue;
-        if (!KEY.test(tx)) continue;          // 只管测验类步骤，视频/学习目标已经处理过
-        if (seen[tx]) continue;               // 同一个页签在多层文档里重复出现
-        seen[tx] = true;
-        tabs.push({ el: el, text: tx });
+        const tx = (el.textContent || '').replace(/\s+/g, '').slice(0, 20);
+        const cardid = (el.getAttribute && el.getAttribute('cardid')) || '';
+        const key = cardid + '|' + tx;
+        if (key !== '|' && seen[key]) continue;   // 同一页签在多层文档里重复出现
+        seen[key] = true;
+        let cls = '';
+        try { cls = el.className || ''; } catch (e) { cls = ''; }
+        tabs.push({ el: el, text: tx || '(未命名卡片)', active: /\bactive\b/.test(cls) });
       }
     }
     return tabs;
   },
 
-  /** 页签是否已标记完成（已批阅 / 已完成 / 打勾） */
-  stepTabDone(el) {
-    let mark = '';
-    try { mark = (el.className || '') + ' ' + (el.innerHTML || ''); } catch (e) { mark = ''; }
-    return /已完成|已批阅|icon_Completed|roundpoint\s+blue/i.test(mark);
+  /**
+   * 等卡片切换完成：点页签后 iframe 重新加载，mArg 换成新卡片的。
+   * 成功信号 = 快照与切换前不同且连续两次稳定（或稳定为空——
+   * 学习目标这类卡片可能根本没有 mArg）。
+   */
+  async waitCardSwitch(beforeSig) {
+    let prev = null;
+    let nullRun = 0;
+    for (let i = 0; i < 12; i++) {
+      await sleep(1000);
+      if (this.stopFlag) return false;
+      const now = this.margSnapshot();
+      if (now !== beforeSig && now !== 'null' && now !== 'err' && now === prev) return true;
+      if (now === 'null') {
+        nullRun++;
+        if (nullRun >= 3 && beforeSig !== 'null') return true;
+      } else {
+        nullRun = 0;
+      }
+      prev = now;
+    }
+    return false;   // 超时：多半点了当前卡片自己，或结构不认识，按现状继续
   },
 
   /**
-   * 处理 cards 页的步骤页签里、mArg 清单没有覆盖到的任务点。
+   * 逐卡片遍历本节：按顺序点每张卡片页签，等它的 mArg 加载出来，
+   * 有未完成任务就按清单处理（视频/文档/作业全走 runTaskList）。
    *
-   * 为什么需要这一步：超星 mooc2 的一节可以是「1 视频 / 2 章节测验」这种多步骤
-   * 结构，而 mArg 的 attachments 里**只列视频**，测验根本不写进去。
-   * 于是视频播完、清单判"全做完"，脚本直接跳下一节——测验标签从头到尾没点过。
-   * 实际故障就是这样：2.3 那节视频刷完了，2 章节测验被整个绕过。
+   * 为什么必须遍历而不是只看当前卡片：每张卡片的 mArg 只列本卡片的任务，
+   * "当前卡片没有待办"推不出"本节做完了"。
    *
-   * @returns {Promise<boolean>} false 表示有测验没做完（主循环应停下，不跳节）
+   * @returns {Promise<boolean>} false 表示有任务没做完（主循环应停下，不跳节）
    */
-  async processStepTabs(defaults, doc) {
-    const tabs = this.findStepTabs();
-    if (!tabs.length) return true;
+  async processAllCards(doc) {
+    const tabs = this.collectCardTabs();
+    if (!tabs.length) return true;   // 没有卡片页签（老版页面/非卡片结构），交回主流程
 
-    for (const t of tabs) {
+    for (const tab of tabs) {
       if (this.stopFlag) return false;
-      // 已经批阅/完成的步骤不用再进
-      if (this.stepTabDone(t.el)) {
-        log('步骤「' + t.text + '」已标记完成，跳过', 'info');
+      if (tab.active) {
+        // 当前正在显示的卡片，主流程已经按它的清单处理过（或确认无待办），
+        // 跳过不重切——重切白等一轮加载，还可能对着旧清单重复处理
+        log('卡片「' + tab.text + '」是当前卡片，跳过重切', 'info');
         continue;
       }
 
-      log('发现步骤「' + t.text + '」（任务清单里没有它），切过去处理', 'info');
-      UI.setStatus('running', t.text);
-      this.clickHard(t.el);
-
-      // 有的版本点开是作业列表，要先点「开始答题/进入作业」
-      let hw = await this.waitHomework(15);
-      if (!hw) {
-        const enter = findButtonByText(['开始答题', '进入作业', '去答题', '开始作答', '继续答题'], document);
-        if (enter) {
-          log('点「' + (enter.textContent || '').trim() + '」进入作业', 'info');
-          this.clickHard(enter);
-          hw = await this.waitHomework(20);
-        }
-      }
-      if (!hw) {
-        // 点开了却没有题：可能本来就已完成（列表页显示"已完成"），也可能结构不认识。
-        // 这里不硬判成功——继续往下走，但把话说清楚，便于事后核对。
-        log('步骤「' + t.text + '」打开后没检测到题目，按已完成处理；如果不放心请回本节看一眼', 'warn');
-        continue;
-      }
-
-      const ok = await this.runHomework();
+      log('切换到卡片「' + tab.text + '」', 'info');
+      UI.setStatus('running', '卡片：' + tab.text);
+      const beforeSig = this.margSnapshot();
+      this.clickHard(tab.el);
+      await this.waitCardSwitch(beforeSig);
       if (this.stopFlag) return false;
-      if (!ok) {
-        log('步骤「' + t.text + '」的作业没做完，自动刷课已暂停 —— 继续往下会把它绕过去', 'error');
-        UI.setStatus('warn', '作业未完成，已暂停');
-        this.running = false;
-        return false;
-      }
-      this.closeWorkFrame(doc);
-      await sleep(3000);
 
-      // 交完卷通常停在批阅页，点「返回」回到本节，不然后面的步骤没得点
-      const back = findButtonByText(['返回', '返 回', '返回课程'], document);
-      if (back) {
-        try { this.clickHard(back); await sleep(2500); } catch (e) { /* 忽略 */ }
-      }
+      const marg = this.findMarg();
+      const tasks = this.parseTasks(marg);
+      const pending = tasks.videos.length + tasks.documents.length +
+        tasks.works.length + tasks.unknown.length;
+      log('卡片「' + tab.text + '」清单：视频 ' + tasks.videos.length + '、文档 ' + tasks.documents.length +
+        '、作业 ' + tasks.works.length +
+        (tasks.unknown.length ? '、未知 ' + tasks.unknown.length : '') +
+        (pending ? ' → 有待办，开始处理' : ' → 无待办'), 'info');
+
+      if (pending === 0) continue;
+      const ok = await this.runTaskList(tasks, doc);
+      if (this.stopFlag || !this.running) return false;
+      if (!ok) return false;   // runTaskList 内部已说明停在哪一步
+      await sleep(2000);
     }
     return true;
   },
@@ -8649,10 +8662,10 @@ const CoursePilot = {
             ' 作业' + tasks.works.length + (tasks.unknown.length ? ' 未知' + tasks.unknown.length : '') + ']'
           : '无任务清单'), 'info');
 
-      // 清单里有任务点但全部已完成 → 本节清单没活了。
-      // 但不能直接跳节：步骤页签里的测验不在 mArg 里，得先过一遍。
+      // 清单里有任务点但全部已完成 → 当前卡片没活了。
+      // 但不能直接跳节：其余卡片的任务不在当前清单里，逐卡片过一遍。
       if (marg && tasks.totalJobs > 0 && taskCount === 0) {
-        const tabsDone = await this.processStepTabs(tasks.defaults, this.doc || document);
+        const tabsDone = await this.processAllCards(this.doc || document);
         if (this.stopFlag || !this.running) break;
         if (!tabsDone) break;
 
@@ -8673,6 +8686,11 @@ const CoursePilot = {
         const ok = await this.runTaskList(tasks, this.doc || document);
         if (this.stopFlag || !this.running) break;
         if (!ok) break;   // runTaskList 内部已说明停在哪一步
+
+        // 当前卡片的任务做完了 ≠ 本节做完了：其余卡片可能还有任务，逐卡片过一遍
+        const cardsDone = await this.processAllCards(this.doc || document);
+        if (this.stopFlag || !this.running) break;
+        if (!cardsDone) break;
 
         // 本节任务全部处理完 → 下一节
         this.stats.sections++;
@@ -8723,6 +8741,11 @@ const CoursePilot = {
       }
 
       // 3) 点下一节
+      // 跳节前先把其余卡片过一遍：当前卡片清单全 0（任务做完后 job 会从清单
+      // 消失）不等于本节做完，测验卡片可能还挂着任务（2.3 的实际故障路径）
+      const cardsBeforeJump = await this.processAllCards(this.doc || document);
+      if (this.stopFlag || !this.running) break;
+      if (!cardsBeforeJump) break;   // processAllCards 里已说明停在哪一步
       const moved = await this.nextSection(this.doc || document);
       if (moved === null) {
         log('没有找到下一节，可能已经是最后一节了', 'success');
