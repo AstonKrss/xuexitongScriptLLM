@@ -137,7 +137,7 @@ const DEFAULT_CONFIG = {
     endpoint: BUILTIN_BANK.endpoint,
     token: BUILTIN_BANK.token,
     timeoutMs: 2500,     // 题库必须快，慢了不如直接用模型
-    order: 'decoded',    // 'decoded' 先查正常文字 | 'raw' 先查加密态原文
+    order: 'raw',        // 'raw' 先查页面加密原文（众包题库原貌） | 'decoded' 先查解码后文字
   },
 
   debug: false,
@@ -180,6 +180,13 @@ const Config = {
       } else if (sb && sb.useBuiltin === undefined) {
         // 老版本存了自己填的地址，没有 useBuiltin 字段 → 按自填模式处理
         b.useBuiltin = false;
+        this.save();
+      }
+      // v1.7.5 迁移：内置众包题库原本存的就是页面加密原文，旧版默认 order='decoded'
+      // 导致已保存过配置的用户升级后仍先拿解码文去查，命中率低。未显式在面板选过策略的
+      // 统一升到 'raw' 优先（由 orderLocked 标记用户是否在面板里手动改过）。
+      if (sb && !sb.orderLocked && b.order === 'decoded') {
+        b.order = 'raw';
         this.save();
       }
     }

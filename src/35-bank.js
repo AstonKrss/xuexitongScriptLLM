@@ -32,7 +32,10 @@ const QuestionBank = {
   },
 
   /**
-   * 按"先解码后原始"的顺序尝试两种题面形式。
+   * 按"先原始加密原文、再解码后文字"的顺序尝试两种题面形式（可配置）。
+   * 原脚本（unrival）靠 hookHTML 上传整页 HTML 喂出来的众包题库，存的本来就是
+   * 页面上的加密原文；先查 raw 直接“暗号对暗号”，查不到再拿解码后的明文查一遍，
+   * 两条路都未命中才落到大模型。
    * @returns {Promise<object|null>} 归一化后的答案对象，或 null
    */
   async lookup(q, cfg) {
@@ -40,13 +43,11 @@ const QuestionBank = {
     if (!cfg || !cfg.enabled || !cfg.endpoint) return null;
     if (!BANK_TYPE[q.type]) return null;     // 填空题题库一般不支持，直接跳过
 
-    // 解码后的文本更符合人类录入的题库；原始乱码符合"从页面抓取众包"的题库。
-    // 两种都试，谁先命中用谁。
     const decoded = q.stem;
     const raw = q.rawStem || q.stem;
-    const candidates = (cfg.order === 'raw')
-      ? [raw, decoded]
-      : [decoded, raw];
+    const candidates = (cfg.order === 'decoded')
+      ? [decoded, raw]
+      : [raw, decoded];
 
     const tried = [];
     for (const text of candidates) {
@@ -135,9 +136,10 @@ function bankToAnswer(text, type) {
     return { choice: letters[0], text: null, confidence: 0.95, fromBank: true };
   }
 
-  // 非纯字母：当作选项原文
+  // 非纯字母：当作选项原文。多选题常见用 #、---、|、；、\n 拼多个选项
   if (type === 'multi') {
-    return { choice: null, text: [s], confidence: 0.95, fromBank: true };
+    const parts = s.split(/\s*(?:#{1,3}|---|\|\|\||[|\n；;])\s*/).map((x) => x.trim()).filter(Boolean);
+    return { choice: null, text: parts.length ? parts : [s], confidence: 0.95, fromBank: true };
   }
   return { choice: null, text: s, confidence: 0.95, fromBank: true };
 }

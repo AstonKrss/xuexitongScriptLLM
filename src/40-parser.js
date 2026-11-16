@@ -814,11 +814,13 @@ const Parser = {
     if (opts.decodeFont && typeof FontDecoder !== 'undefined' && FontDecoder.ready) {
       for (const q of questions) {
         const before = q.stem;
-        // 保留加密态原文：题库若是从页面抓取众包来的，存的可能就是这个形式
+        // 保留加密态原文：题库若是从页面抓取众包来的，存的可能就是这个形式；
+        // 选项也要留一份 rawOrigText，防止题库返回的是加密态选项原文时匹配不上。
         q.rawStem = before;
         q.stem = FontDecoder.decode(q.stem);
         if (q.stem !== before) decodedCount++;
         (q.options || []).forEach((o) => {
+          o.rawOrigText = o.text;
           o.text = FontDecoder.decode(o.text);
           o.rawText = FontDecoder.decode(o.rawText || '');
         });

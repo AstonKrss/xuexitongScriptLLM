@@ -54,16 +54,24 @@ function scoreOption(optionText, answerText) {
   return 0;
 }
 
+function scoreOptionBoth(o, answerText) {
+  let s = scoreOption(o.text, answerText);
+  if (o.rawOrigText && o.rawOrigText !== o.text) {
+    s = Math.max(s, scoreOption(o.rawOrigText, answerText));
+  }
+  return s;
+}
+
 /**
  * 单选题匹配：返回 { option, score, method } 或 null
  */
 function matchSingle(q, ans) {
   const candidates = [];
 
-  // 第一优先：按选项原文匹配
+  // 第一优先：按选项原文匹配（同时比对解码后文本和加密态原文，兼容众包题库返回的加密原文）
   if (ans.text) {
     for (const o of q.options) {
-      const s = scoreOption(o.text, ans.text);
+      const s = scoreOptionBoth(o, ans.text);
       if (s > 0) candidates.push({ option: o, score: s, method: 'text' });
     }
     // 模型给了原文但一个选项都对不上，说明它在改写选项而不是逐字复制。
@@ -98,7 +106,7 @@ function matchMulti(q, ans) {
   for (const t of texts) {
     let best = null;
     q.options.forEach((o, i) => {
-      const s = scoreOption(o.text, t);
+      const s = scoreOptionBoth(o, t);
       if (s >= MATCH_THRESHOLD && (!best || s > best.score)) best = { option: o, score: s, method: 'text', idx: i };
     });
     if (best) picked.set(best.idx, best);

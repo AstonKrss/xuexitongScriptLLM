@@ -261,7 +261,12 @@ const UI = {
   <input type="text" id="f-bankurl" placeholder="https://cx.icodef.com/wyn-nb?v=4">
   <label>Token</label>
   <input type="text" id="f-banktoken" placeholder="题库要求的鉴权 token">
-  <p class="hint">内置题库是原脚本用的那家众包题库，返回标准答案，比模型推理准且不花 token。但它只收录众包的题，冷门课和新专题大概率查不到，查不到会自动落到模型。接口连续失败两三次会整轮停用，日志里有提示。</p>
+  <label>查题文本顺序</label>
+  <select id="f-bankorder">
+    <option value="raw">优先页面原文（含加密字符，原脚本同款，推荐）</option>
+    <option value="decoded">优先字体解码后文字（自建明文题库用）</option>
+  </select>
+  <p class="hint">内置题库是原脚本用的那家众包题库，返回标准答案，比模型推理准且不花 token。默认先拿页面加密原文直接查（众包抓取的就是原文），查不到再试解码后的明文，两条路都未命中才落到模型。接口连续失败两三次会整轮停用，日志里有提示。</p>
 
   <div class="sep"></div>
   <h4>答题策略</h4>
@@ -463,6 +468,8 @@ const UI = {
       // 题库配置存在 cfg.bank 里，和答题策略分开
       cfg.bank.enabled = q('#f-bank').checked;
       cfg.bank.useBuiltin = q('#f-bankbuiltin').checked;
+      cfg.bank.order = q('#f-bankorder').value === 'decoded' ? 'decoded' : 'raw';
+      cfg.bank.orderLocked = true;
       if (cfg.bank.useBuiltin) {
         // 内置模式下地址和 token 永远是常量，不接受面板里的值，避免被误改后静默失效
         cfg.bank.endpoint = BUILTIN_BANK.endpoint;
@@ -617,6 +624,7 @@ const UI = {
     q('#f-bankbuiltin').checked = bank.useBuiltin !== false;
     q('#f-bankurl').value = bank.endpoint || BUILTIN_BANK.endpoint;
     q('#f-banktoken').value = bank.token || BUILTIN_BANK.token;
+    if (q('#f-bankorder')) q('#f-bankorder').value = bank.order === 'decoded' ? 'decoded' : 'raw';
     this.syncBankInputs();
     q('#f-dmin').value = Math.round((quiz.fillDelayMin || 0) / 1000);
     q('#f-dmax').value = Math.round((quiz.fillDelayMax || 0) / 1000);

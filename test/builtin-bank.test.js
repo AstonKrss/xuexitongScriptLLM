@@ -64,6 +64,7 @@ eq(Config.bank.enabled, true, '★ 默认就启用题库优先，不需要用户
 eq(Config.bank.useBuiltin, true, '默认走内置题库');
 eq(Config.bank.endpoint, BUILTIN_BANK.endpoint, '取到的是内置地址');
 eq(Config.bank.token, BUILTIN_BANK.token, '取到的是内置 token');
+eq(Config.bank.order, 'raw', '★ 默认优先使用页面加密原文查题库（众包题库原貌）');
 ok(Config.bank.timeoutMs > 0 && Config.bank.timeoutMs <= 5000, '超时时间在合理区间（题库必须快）');
 
 /* ---------- 内置模式下不允许被覆盖 ---------- */
@@ -100,8 +101,19 @@ reset(JSON.stringify({
 eq(Config.bank.enabled, true, '★ 空地址的老配置被自动启用');
 eq(Config.bank.endpoint, BUILTIN_BANK.endpoint, '★ 空地址被回填成内置地址');
 eq(Config.bank.token, BUILTIN_BANK.token, '★ 空 token 被回填成内置 token');
+eq(Config.bank.order, 'raw', '★ 老配置未显式锁定 order 时自动升为 raw 优先');
 ok(Config.bank.useBuiltin === true, '迁移后标记为内置模式');
 ok(!!mem.get('llmq:config'), '迁移结果已写回存储，下次启动不用再迁一次');
+
+// 用户主动在面板选择 decoded 并锁定后，不会被迁移逻辑强行改回 raw
+reset(JSON.stringify({
+  bank: { enabled: true, useBuiltin: false, endpoint: 'https://my.bank/api', token: 't', order: 'decoded', orderLocked: true },
+}));
+eq(Config.bank.order, 'decoded', '★ 用户手动锁定 decoded 后不被覆盖');
+reset(JSON.stringify({
+  bank: { enabled: false, endpoint: '', token: '', timeoutMs: 2500, order: 'decoded' },
+}));
+Config.load();
 
 // 迁移只发生一次：用户之后主动关掉，不应该被再次打开
 Config.load().bank.enabled = false;

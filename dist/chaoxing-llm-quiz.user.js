@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.7.4
+// @version      1.7.5
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
@@ -40,7 +40,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.7.4';
+const VERSION = '1.7.5';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 /* ---------- 脚本管理器能力探测 ---------- */
@@ -3412,7 +3412,7 @@ const DEFAULT_CONFIG = {
     endpoint: BUILTIN_BANK.endpoint,
     token: BUILTIN_BANK.token,
     timeoutMs: 2500,     // 题库必须快，慢了不如直接用模型
-    order: 'decoded',    // 'decoded' 先查正常文字 | 'raw' 先查加密态原文
+    order: 'raw',        // 'raw' 先查页面加密原文（众包题库原貌） | 'decoded' 先查解码后文字
   },
 
   debug: false,
@@ -3455,6 +3455,13 @@ const Config = {
       } else if (sb && sb.useBuiltin === undefined) {
         // 老版本存了自己填的地址，没有 useBuiltin 字段 → 按自填模式处理
         b.useBuiltin = false;
+        this.save();
+      }
+      // v1.7.5 迁移：内置众包题库原本存的就是页面加密原文，旧版默认 order='decoded'
+      // 导致已保存过配置的用户升级后仍先拿解码文去查，命中率低。未显式在面板选过策略的
+      // 统一升到 'raw' 优先（由 orderLocked 标记用户是否在面板里手动改过）。
+      if (sb && !sb.orderLocked && b.order === 'decoded') {
+        b.order = 'raw';
         this.save();
       }
     }
@@ -4053,7 +4060,10 @@ const QuestionBank = {
   },
 
   /**
-   * 按"先解码后原始"的顺序尝试两种题面形式。
+   * 按"先原始加密原文、再解码后文字"的顺序尝试两种题面形式（可配置）。
+   * 原脚本（unrival）靠 hookHTML 上传整页 HTML 喂出来的众包题库，存的本来就是
+   * 页面上的加密原文；先查 raw 直接“暗号对暗号”，查不到再拿解码后的明文查一遍，
+   * 两条路都未命中才落到大模型。
    * @returns {Promise<object|null>} 归一化后的答案对象，或 null
    */
   async lookup(q, cfg) {
@@ -4061,13 +4071,11 @@ const QuestionBank = {
     if (!cfg || !cfg.enabled || !cfg.endpoint) return null;
     if (!BANK_TYPE[q.type]) return null;     // 填空题题库一般不支持，直接跳过
 
-    // 解码后的文本更符合人类录入的题库；原始乱码符合"从页面抓取众包"的题库。
-    // 两种都试，谁先命中用谁。
     const decoded = q.stem;
     const raw = q.rawStem || q.stem;
-    const candidates = (cfg.order === 'raw')
-      ? [raw, decoded]
-      : [decoded, raw];
+    const candidates = (cfg.order === 'decoded')
+      ? [decoded, raw]
+      : [raw, decoded];
 
     const tried = [];
     for (const text of candidates) {
@@ -4156,9 +4164,10 @@ function bankToAnswer(text, type) {
     return { choice: letters[0], text: null, confidence: 0.95, fromBank: true };
   }
 
-  // 非纯字母：当作选项原文
+  // 非纯字母：当作选项原文。多选题常见用 #、---、|、；、\n 拼多个选项
   if (type === 'multi') {
-    return { choice: null, text: [s], confidence: 0.95, fromBank: true };
+    const parts = s.split(/\s*(?:#{1,3}|---|\|\|\||[|\n；;])\s*/).map((x) => x.trim()).filter(Boolean);
+    return { choice: null, text: parts.length ? parts : [s], confidence: 0.95, fromBank: true };
   }
   return { choice: null, text: s, confidence: 0.95, fromBank: true };
 }
@@ -4983,11 +4992,13 @@ const Parser = {
     if (opts.decodeFont && typeof FontDecoder !== 'undefined' && FontDecoder.ready) {
       for (const q of questions) {
         const before = q.stem;
-        // 保留加密态原文：题库若是从页面抓取众包来的，存的可能就是这个形式
+        // 保留加密态原文：题库若是从页面抓取众包来的，存的可能就是这个形式；
+        // 选项也要留一份 rawOrigText，防止题库返回的是加密态选项原文时匹配不上。
         q.rawStem = before;
         q.stem = FontDecoder.decode(q.stem);
         if (q.stem !== before) decodedCount++;
         (q.options || []).forEach((o) => {
+          o.rawOrigText = o.text;
           o.text = FontDecoder.decode(o.text);
           o.rawText = FontDecoder.decode(o.rawText || '');
         });
@@ -5715,16 +5726,24 @@ function scoreOption(optionText, answerText) {
   return 0;
 }
 
+function scoreOptionBoth(o, answerText) {
+  let s = scoreOption(o.text, answerText);
+  if (o.rawOrigText && o.rawOrigText !== o.text) {
+    s = Math.max(s, scoreOption(o.rawOrigText, answerText));
+  }
+  return s;
+}
+
 /**
  * 单选题匹配：返回 { option, score, method } 或 null
  */
 function matchSingle(q, ans) {
   const candidates = [];
 
-  // 第一优先：按选项原文匹配
+  // 第一优先：按选项原文匹配（同时比对解码后文本和加密态原文，兼容众包题库返回的加密原文）
   if (ans.text) {
     for (const o of q.options) {
-      const s = scoreOption(o.text, ans.text);
+      const s = scoreOptionBoth(o, ans.text);
       if (s > 0) candidates.push({ option: o, score: s, method: 'text' });
     }
     // 模型给了原文但一个选项都对不上，说明它在改写选项而不是逐字复制。
@@ -5759,7 +5778,7 @@ function matchMulti(q, ans) {
   for (const t of texts) {
     let best = null;
     q.options.forEach((o, i) => {
-      const s = scoreOption(o.text, t);
+      const s = scoreOptionBoth(o, t);
       if (s >= MATCH_THRESHOLD && (!best || s > best.score)) best = { option: o, score: s, method: 'text', idx: i };
     });
     if (best) picked.set(best.idx, best);
@@ -9204,7 +9223,12 @@ const UI = {
   <input type="text" id="f-bankurl" placeholder="https://cx.icodef.com/wyn-nb?v=4">
   <label>Token</label>
   <input type="text" id="f-banktoken" placeholder="题库要求的鉴权 token">
-  <p class="hint">内置题库是原脚本用的那家众包题库，返回标准答案，比模型推理准且不花 token。但它只收录众包的题，冷门课和新专题大概率查不到，查不到会自动落到模型。接口连续失败两三次会整轮停用，日志里有提示。</p>
+  <label>查题文本顺序</label>
+  <select id="f-bankorder">
+    <option value="raw">优先页面原文（含加密字符，原脚本同款，推荐）</option>
+    <option value="decoded">优先字体解码后文字（自建明文题库用）</option>
+  </select>
+  <p class="hint">内置题库是原脚本用的那家众包题库，返回标准答案，比模型推理准且不花 token。默认先拿页面加密原文直接查（众包抓取的就是原文），查不到再试解码后的明文，两条路都未命中才落到模型。接口连续失败两三次会整轮停用，日志里有提示。</p>
 
   <div class="sep"></div>
   <h4>答题策略</h4>
@@ -9406,6 +9430,8 @@ const UI = {
       // 题库配置存在 cfg.bank 里，和答题策略分开
       cfg.bank.enabled = q('#f-bank').checked;
       cfg.bank.useBuiltin = q('#f-bankbuiltin').checked;
+      cfg.bank.order = q('#f-bankorder').value === 'decoded' ? 'decoded' : 'raw';
+      cfg.bank.orderLocked = true;
       if (cfg.bank.useBuiltin) {
         // 内置模式下地址和 token 永远是常量，不接受面板里的值，避免被误改后静默失效
         cfg.bank.endpoint = BUILTIN_BANK.endpoint;
@@ -9560,6 +9586,7 @@ const UI = {
     q('#f-bankbuiltin').checked = bank.useBuiltin !== false;
     q('#f-bankurl').value = bank.endpoint || BUILTIN_BANK.endpoint;
     q('#f-banktoken').value = bank.token || BUILTIN_BANK.token;
+    if (q('#f-bankorder')) q('#f-bankorder').value = bank.order === 'decoded' ? 'decoded' : 'raw';
     this.syncBankInputs();
     q('#f-dmin').value = Math.round((quiz.fillDelayMin || 0) / 1000);
     q('#f-dmax').value = Math.round((quiz.fillDelayMax || 0) / 1000);
