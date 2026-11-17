@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         超星答题助手 · 自建 LLM 题库
 // @namespace    https://github.com/AstonKrss/xuexitongScriptLLM
-// @version      1.7.5
+// @version      1.7.6
 // @description  用你自己的大模型 API 自动作答超星章节测试与作业，并按课程任务清单自动刷视频/文档/切下一节。支持 DeepSeek、智谱 GLM、通义千问、Kimi 及任意 OpenAI 兼容接口。答案本地缓存，同一道题只花一次 token。
 // @author       AstonKrss
 // @license      MIT
 // @homepageURL  https://github.com/AstonKrss/xuexitongScriptLLM
 // @supportURL   https://github.com/AstonKrss/xuexitongScriptLLM/issues
 // @source       https://github.com/AstonKrss/xuexitongScriptLLM
+// @updateURL    https://raw.githubusercontent.com/AstonKrss/xuexitongScriptLLM/main/dist/chaoxing-llm-quiz.user.js
+// @downloadURL  https://raw.githubusercontent.com/AstonKrss/xuexitongScriptLLM/main/dist/chaoxing-llm-quiz.user.js
 // @run-at       document-end
 // @match        *://*.chaoxing.com/*
 // @match        *://chaoxing.com/*
@@ -40,7 +42,7 @@
 // 版本号唯一来源是 header.txt 里的 @version，由 build.js 在构建时注入到这里。
 // 不要在这个文件里硬编码版本号——之前两处各写一遍，结果改了一处忘了另一处，
 // 用户看到的版本号和文档里写的对不上。
-const VERSION = '1.7.5';
+const VERSION = '1.7.6';
 const NS = 'llmq'; // 存储键前缀，避免与其他脚本的 GM 存储键冲突
 
 /* ---------- 脚本管理器能力探测 ---------- */
